@@ -10,13 +10,13 @@ parallel-jobs = 1
 app-name = "YouTube"
 patches-source = "MorpheApp/morphe-patches"
 cli-source = "MorpheApp/morphe-cli"
-patch-version = "dev"
+patches-version = "dev"
 cli-version = "dev"
 rv-brand = "Morphe"
 build-mode = "both"
 apkmirror-dlurl = "https://www.apkmirror.com/apk/google-inc/youtube"
 uptodown-dlurl = "https://youtube.en.uptodown.com/android"
-version = "21.18.165"
+version = "21.18.168"
 arch = "all"
 patcher-args = """\
     --striplibs arm64-v8a \
