@@ -16,7 +16,8 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          token: ${{ secrets.SYNC_AUTH }}
+          env:
+          github token: ${{ secrets.SYNC_AUTH }}
 
       - name: Sync upstream & clean files
         run: |
