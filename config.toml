@@ -22,7 +22,6 @@ rv-brand = "Morphe"
 build-mode = "both"
 apkmirror-dlurl = "https://www.apkmirror.com/apk/google-inc/youtube"
 uptodown-dlurl = "https://youtube.en.uptodown.com/android"
-version = "experimental"
 included-patches = ""
 excluded-patches = """\
     'Custom branding' \
