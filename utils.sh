@@ -1222,8 +1222,7 @@ module_prop() {
 name=${2}
 version=v${3}
 versionCode=${NEXT_VER_CODE}
-author=dj_tanjid | j-hc
-banner=https://raw.githubusercontent.com/dj-tanjid/Morphe-ReVancedX-Builder/teejay/${1}/banner.webp
+author=j-hc
 description=${4}" >"${6}/module.prop"
 
 	if [[ "$ENABLE_MODULE_UPDATE" == true ]]; then echo "updateJson=${5}" >>"${6}/module.prop"; fi
