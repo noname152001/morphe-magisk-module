@@ -5,11 +5,15 @@ CWD=$(pwd)
 TEMP_DIR="temp"
 BIN_DIR="bin"
 BUILD_DIR="build"
-DL_SRCS=("direct" "github" "archive" "apkmirror" "uptodown")
+# Prioritized source list: APKMirror -> Uptodown -> GitHub -> Direct override -> Archive
+DL_SRCS=("apkmirror" "uptodown" "github" "direct" "archive")
 
 if [ "${GITHUB_TOKEN-}" ]; then GH_HEADER="Authorization: token ${GITHUB_TOKEN}"; else GH_HEADER=; fi
 NEXT_VER_CODE=${NEXT_VER_CODE:-$(date +'%Y%m%d')}
 OS=$(uname -o)
+
+DEF_PATCHES_SRC="github:MorpheApp/morphe-patches"
+DEF_CLI_SRC="github:MorpheApp/morphe-desktop"
 
 toml_prep() {
 	if [ ! -f "$1" ]; then return 1; fi
@@ -24,7 +28,7 @@ toml_get_table_main() { jq -r -e 'to_entries | map(select(.value | type != "obje
 toml_get_table() { jq -r -e ".\"${1}\"" <<<"$__TOML__"; }
 toml_get() {
 	local op quote_placeholder=$'\001'
-	op=$(jq -r ".\"${2}\" | values" <<<"$1" 2>/dev/null)
+	op=$(jq -r ".\"${2}\" | if type == \"array\" then join(\" \") else . end | values" <<<"$1" 2>/dev/null)
 	if [[ -n "$op" && "$op" != "null" ]]; then
 		op=$(echo "$op" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 		op=${op//\\\'/$quote_placeholder}
@@ -66,73 +70,110 @@ java() {
 }
 
 get_prebuilts() {
-	local cli_src=${1:-} cli_ver=${2:-latest} patches_src=${3:-} patches_ver=${4:-latest}
-	pr "Getting prebuilts (${patches_src%/*})" >&2
-	local cl_dir=${patches_src%/*}
-	cl_dir=${TEMP_DIR}/${cl_dir,,}-rv
-	[[ -d "$cl_dir" ]] || mkdir -p "$cl_dir"
+	local cli_src=${1:-$DEF_CLI_SRC} cli_ver=${2:-latest}
+	local patches_src=${3:-$DEF_PATCHES_SRC} patches_ver=${4:-latest}
 
-	for src_ver in "Patches $patches_src $patches_ver" "CLI $cli_src $cli_ver"; do
-		set -- $src_ver
-		local tag=$1 src=$2 ver=${3-}
+	read -r -a p_src_arr <<< "$(echo "$patches_src" | tr ',' ' ')"
+	read -r -a p_ver_arr <<< "$(echo "$patches_ver" | tr ',' ' ')"
 
-		local dir=${src%/*}
-		dir=${TEMP_DIR}/${dir,,}-rv
+	local collected_patch_files=()
+
+	for i in "${!p_src_arr[@]}"; do
+		local raw_p_src="${p_src_arr[$i]}"
+		local p_ver="${p_ver_arr[$i]:-${p_ver_arr[0]:-latest}}"
+
+		local host="github"
+		local clean_src="$raw_p_src"
+		if [[ "$raw_p_src" =~ ^gitlab:(.+) ]]; then
+			host="gitlab"
+			clean_src="${BASH_REMATCH[1]}"
+		elif [[ "$raw_p_src" =~ ^github:(.+) ]]; then
+			host="github"
+			clean_src="${BASH_REMATCH[1]}"
+		fi
+
+		local org="${clean_src%/*}"
+		local dir="${TEMP_DIR}/${org,,}-rv"
 		[[ -d "$dir" ]] || mkdir -p "$dir"
 
-		local rv_rel="https://api.github.com/repos/${src}/releases" name_ver
-		if [[ "$ver" == "dev" ]]; then
-			local resp
-			resp=$(gh_req "$rv_rel" -) || return 1
-			ver=$(jq -e -r '.[] | .tag_name' <<<"$resp" | get_highest_ver) || return 1
-		fi
-		if [[ "$ver" == "latest" ]]; then
-			rv_rel+="/latest"
-			name_ver="*"
-		else
-			rv_rel+="/tags/${ver}"
-			name_ver="$ver"
+		pr "Getting prebuilts (${clean_src})" >&2
+
+		local name_ver="*"
+		if [[ "$p_ver" != "latest" ]]; then
+			name_ver="$p_ver"
 		fi
 
-		local file
-		if [ "$tag" = "CLI" ]; then
-			file=$(find "$dir" -maxdepth 1 -name "*cli-${name_ver#v}*.jar" -o -name "*desktop-${name_ver#v}*.jar" -type f 2>/dev/null)
-			local grab_cl=false
-		elif [ "$tag" = "Patches" ]; then
-			file=$(find "$dir" -maxdepth 1 -name "*patches-${name_ver#v}.*" -type f 2>/dev/null)
-			local grab_cl=true
-		else abort unreachable; fi
-
-		local url tag_name matches
-		if [ "$ver" = "latest" ]; then
-			file=$(grep -v '/[^/]*dev[^/]*$' <<<"$file" | head -1)
-		else
-			file=$(grep "/[^/]*${ver#v}[^/]*\$" <<<"$file" | head -1)
+		local file=""
+		file=$(find "$dir" -maxdepth 1 -name "*patches-${name_ver#v}.*" -type f 2>/dev/null)
+		if [[ -n "$file" ]]; then
+			if [ "$p_ver" = "latest" ]; then
+				file=$(grep -v '/[^/]*dev[^/]*$' <<<"$file" | head -1)
+			else
+				file=$(grep "/[^/]*${p_ver#v}[^/]*\$" <<<"$file" | head -1)
+			fi
 		fi
+
+		local grab_cl=true
 		if [[ -z "$file" ]]; then
-			local resp asset name
-			resp=$(gh_req "$rv_rel" -) || return 1
-			tag_name=$(jq -r '.tag_name' <<<"$resp") || return 1
-			matches=$(jq -e '.assets | map(select(.name | (endswith("asc") or endswith("json")) | not))' <<<"$resp") || return 1
+			local resp="" matches="" asset="" name="" tag_name=""
+			if [ "$host" = "gitlab" ]; then
+				local project_enc="${clean_src//\//%2F}"
+				local gl_rel="https://gitlab.com/api/v4/projects/${project_enc}/releases"
+				if [[ "$p_ver" == "dev" ]]; then
+					resp=$(req "$gl_rel" -) || return 1
+					p_ver=$(jq -e -r '.[].tag_name' <<<"$resp" | get_highest_ver) || return 1
+				fi
+				if [[ "$p_ver" == "latest" ]]; then
+					resp=$(req "${gl_rel}/permalink/latest" -) || return 1
+				else
+					resp=$(req "${gl_rel}/${p_ver}" -) || return 1
+				fi
+				tag_name=$(jq -r '.tag_name // empty' <<<"$resp") || return 1
+				matches=$(jq -e '.assets.links // [] | map(select(.name | (endswith("asc") or endswith("json")) | not))' <<<"$resp" 2>/dev/null || jq -e '.assets // []' <<<"$resp") || return 1
+			else
+				local gh_rel="https://api.github.com/repos/${clean_src}/releases"
+				if [[ "$p_ver" == "dev" ]]; then
+					resp=$(gh_req "$gh_rel" -) || return 1
+					p_ver=$(jq -e -r '.[] | .tag_name' <<<"$resp" | get_highest_ver) || return 1
+				fi
+				if [[ "$p_ver" == "latest" ]]; then
+					gh_rel+="/latest"
+				else
+					gh_rel+="/tags/${p_ver}"
+				fi
+				resp=$(gh_req "$gh_rel" -) || return 1
+				tag_name=$(jq -r '.tag_name' <<<"$resp") || return 1
+				matches=$(jq -e '.assets | map(select(.name | (endswith("asc") or endswith("json")) | not))' <<<"$resp") || return 1
+			fi
+
 			if [[ "$(jq 'length' <<<"$matches")" -gt 1 ]]; then
 				local matches_new
-				matches_new=$(jq -e -r 'map(select(.name | contains("-dev") | not))' <<<"$matches")
+				matches_new=$(jq -e -r 'map(select(.name | contains("-dev") | not))' <<<"$matches" 2>/dev/null)
 				if [[ "$(jq 'length' <<<"$matches_new")" -eq 1 ]]; then
 					matches=$matches_new
 				fi
 			fi
+
 			if [[ "$(jq 'length' <<<"$matches")" -eq 0 ]]; then
-				epr "No asset was found"
+				epr "No patch asset was found for ${raw_p_src}"
 				return 1
-			elif [[ "$(jq 'length' <<<"$matches")" -ne 1 ]]; then
-				wpr "More than 1 asset was found for this release. Falling back to the first one found..."
 			fi
+
 			asset=$(jq -r ".[0]" <<<"$matches")
-			url=$(jq -r .url <<<"$asset")
-			name=$(jq -r .name <<<"$asset")
+			name=$(jq -r '.name' <<<"$asset")
 			file="${dir}/${name}"
-			gh_dl "$file" >&2 "$url" || return 1
-			echo "$tag: $(cut -d/ -f1 <<<"$src")/${name}  " >>"${cl_dir}/changelog.md"
+
+			if [ "$host" = "gitlab" ]; then
+				local url
+				url=$(jq -r '.direct_asset_url // .url' <<<"$asset")
+				pr "Getting '$file' from '$url'" >&2
+				_req "$url" "$file" || return 1
+			else
+				local url
+				url=$(jq -r '.url' <<<"$asset")
+				gh_dl "$file" >&2 "$url" || return 1
+			fi
+			echo "Patches: ${org}/${name}  " >>"${dir}/changelog.md"
 		else
 			grab_cl=false
 			name=$(basename "$file")
@@ -140,11 +181,19 @@ get_prebuilts() {
 			tag_name=v${tag_name%.*}
 		fi
 
-		if [[ "$tag" == "Patches" ]]; then
-			if [[ "$grab_cl" == true ]]; then echo -e "[Changelog](https://github.com/${src}/releases/tag/${tag_name})\n" >>"${cl_dir}/changelog.md"; fi
-			if [[ "${REMOVE_RV_INTEGRATIONS_CHECKS:-}" == true ]]; then
-				local extensions_ext
-				extensions_ext=$(unzip -l "${file}" "extensions/shared.*" | grep -o "shared\..*") extensions_ext="${extensions_ext#*.}"
+		if [[ "$grab_cl" == true ]]; then
+			if [ "$host" = "gitlab" ]; then
+				echo -e "[Changelog](https://gitlab.com/${clean_src}/-/releases/${tag_name})\n" >>"${dir}/changelog.md"
+			else
+				echo -e "[Changelog](https://github.com/${clean_src}/releases/tag/${tag_name})\n" >>"${dir}/changelog.md"
+			fi
+		fi
+
+		if [[ "${REMOVE_RV_INTEGRATIONS_CHECKS:-}" == true ]]; then
+			local extensions_ext
+			extensions_ext=$(unzip -l "${file}" "extensions/shared.*" 2>/dev/null | grep -o "shared\..*") || true
+			extensions_ext="${extensions_ext#*.}"
+			if [[ -n "$extensions_ext" ]]; then
 				if ! (
 					mkdir -p "${file}-zip" || return 1
 					unzip -qo "${file}" -d "${file}-zip" || return 1
@@ -156,12 +205,104 @@ get_prebuilts() {
 				) >&2; then
 					echo >&2 "Patching revanced-integrations failed"
 				fi
-				rm -r "${file}-zip" || :
+				rm -rf "${file}-zip" || :
 			fi
 		fi
-		echo -n "$file "
+
+		collected_patch_files+=("$file")
 	done
-	echo
+
+	# Fetch CLI
+	local cli_host="github"
+	local clean_cli="$cli_src"
+	if [[ "$cli_src" =~ ^gitlab:(.+) ]]; then
+		cli_host="gitlab"
+		clean_cli="${BASH_REMATCH[1]}"
+	elif [[ "$cli_src" =~ ^github:(.+) ]]; then
+		cli_host="github"
+		clean_cli="${BASH_REMATCH[1]}"
+	fi
+
+	local cli_org="${clean_cli%/*}"
+	local cli_dir="${TEMP_DIR}/${cli_org,,}-rv"
+	[[ -d "$cli_dir" ]] || mkdir -p "$cli_dir"
+
+	local cli_name_ver="*"
+	if [[ "$cli_ver" != "latest" ]]; then
+		cli_name_ver="$cli_ver"
+	fi
+
+	local cli_file=""
+	cli_file=$(find "$cli_dir" -maxdepth 1 -name "*cli-${cli_name_ver#v}*.jar" -o -name "*desktop-${cli_name_ver#v}*.jar" -type f 2>/dev/null)
+	if [[ -n "$cli_file" ]]; then
+		if [ "$cli_ver" = "latest" ]; then
+			cli_file=$(grep -v '/[^/]*dev[^/]*$' <<<"$cli_file" | head -1)
+		else
+			cli_file=$(grep "/[^/]*${cli_ver#v}[^/]*\$" <<<"$cli_file" | head -1)
+		fi
+	fi
+
+	if [[ -z "$cli_file" ]]; then
+		local resp="" matches="" asset="" name=""
+		if [ "$cli_host" = "gitlab" ]; then
+			local project_enc="${clean_cli//\//%2F}"
+			local gl_rel="https://gitlab.com/api/v4/projects/${project_enc}/releases"
+			if [[ "$cli_ver" == "dev" ]]; then
+				resp=$(req "$gl_rel" -) || return 1
+				cli_ver=$(jq -e -r '.[].tag_name' <<<"$resp" | get_highest_ver) || return 1
+			fi
+			if [[ "$cli_ver" == "latest" ]]; then
+				resp=$(req "${gl_rel}/permalink/latest" -) || return 1
+			else
+				resp=$(req "${gl_rel}/${cli_ver}" -) || return 1
+			fi
+			matches=$(jq -e '.assets.links // [] | map(select(.name | (endswith("asc") or endswith("json")) | not))' <<<"$resp" 2>/dev/null || jq -e '.assets // []' <<<"$resp") || return 1
+		else
+			local gh_rel="https://api.github.com/repos/${clean_cli}/releases"
+			if [[ "$cli_ver" == "dev" ]]; then
+				resp=$(gh_req "$gh_rel" -) || return 1
+				cli_ver=$(jq -e -r '.[] | .tag_name' <<<"$resp" | get_highest_ver) || return 1
+			fi
+			if [[ "$cli_ver" == "latest" ]]; then
+				gh_rel+="/latest"
+			else
+				gh_rel+="/tags/${cli_ver}"
+			fi
+			resp=$(gh_req "$gh_rel" -) || return 1
+			matches=$(jq -e '.assets | map(select(.name | (endswith("asc") or endswith("json")) | not))' <<<"$resp") || return 1
+		fi
+
+		if [[ "$(jq 'length' <<<"$matches")" -gt 1 ]]; then
+			local matches_new
+			matches_new=$(jq -e -r 'map(select(.name | contains("-dev") | not))' <<<"$matches" 2>/dev/null)
+			if [[ "$(jq 'length' <<<"$matches_new")" -eq 1 ]]; then
+				matches=$matches_new
+			fi
+		fi
+
+		if [[ "$(jq 'length' <<<"$matches")" -eq 0 ]]; then
+			epr "No CLI asset was found for ${cli_src}"
+			return 1
+		fi
+
+		asset=$(jq -r ".[0]" <<<"$matches")
+		name=$(jq -r '.name' <<<"$asset")
+		cli_file="${cli_dir}/${name}"
+
+		if [ "$cli_host" = "gitlab" ]; then
+			local url
+			url=$(jq -r '.direct_asset_url // .url' <<<"$asset")
+			pr "Getting '$cli_file' from '$url'" >&2
+			_req "$url" "$cli_file" || return 1
+		else
+			local url
+			url=$(jq -r '.url' <<<"$asset")
+			gh_dl "$cli_file" >&2 "$url" || return 1
+		fi
+		echo "CLI: ${cli_org}/${name}  " >>"${cli_dir}/changelog.md"
+	fi
+
+	echo "${collected_patch_files[*]} ${cli_file}"
 }
 
 set_prebuilts() {
@@ -185,34 +326,73 @@ config_update() {
 		t=$(toml_get_table "$table_name")
 		enabled=$(toml_get "$t" enabled) || enabled=true
 		if [ "$enabled" = "false" ]; then continue; fi
+
 		PATCHES_SRC=$(toml_get "$t" patches-source) || PATCHES_SRC=$DEF_PATCHES_SRC
 		PATCHES_VER=$(toml_get "$t" patches-version) || PATCHES_VER=$DEF_PATCHES_VER
-		if [[ -v sources["$PATCHES_SRC/$PATCHES_VER"] ]]; then
-			if [ "${sources["$PATCHES_SRC/$PATCHES_VER"]}" = 1 ]; then upped+=("$table_name"); fi
-		else
-			sources["$PATCHES_SRC/$PATCHES_VER"]=0
-			local rv_rel="https://api.github.com/repos/${PATCHES_SRC}/releases"
-			if [ "$PATCHES_VER" = "dev" ]; then
-				last_patches=$(gh_req "$rv_rel" - | jq -e -r '.[0]') || continue
-			elif [ "$PATCHES_VER" = "latest" ]; then
-				last_patches=$(gh_req "$rv_rel/latest" -) || continue
+
+		read -r -a p_src_arr <<< "$(echo "$PATCHES_SRC" | tr ',' ' ')"
+		read -r -a p_ver_arr <<< "$(echo "$PATCHES_VER" | tr ',' ' ')"
+
+		for i in "${!p_src_arr[@]}"; do
+			local raw_src="${p_src_arr[$i]}"
+			local p_ver="${p_ver_arr[$i]:-${p_ver_arr[0]:-latest}}"
+
+			local host="github"
+			local clean_src="$raw_src"
+			if [[ "$raw_src" =~ ^gitlab:(.+) ]]; then
+				host="gitlab"
+				clean_src="${BASH_REMATCH[1]}"
+			elif [[ "$raw_src" =~ ^github:(.+) ]]; then
+				host="github"
+				clean_src="${BASH_REMATCH[1]}"
+			fi
+			local org="${clean_src%/*}"
+
+			if [[ -v sources["$raw_src/$p_ver"] ]]; then
+				if [ "${sources["$raw_src/$p_ver"]}" = 1 ]; then upped+=("$table_name"); fi
 			else
-				last_patches=$(gh_req "$rv_rel/tags/${PATCHES_VER}" -) || continue
-			fi
-			if ! last_patches=$(jq -e -r '.assets[] | select(.name | (endswith("asc") or endswith("json")) | not) | .name' <<<"$last_patches"); then
-				abort "config_update error: '$last_patches'"
-			fi
-			if [ "$last_patches" ]; then
-				if ! OP=$(grep "^Patches: ${PATCHES_SRC%%/*}/" build.md | grep -m1 "$last_patches"); then
-					sources["$PATCHES_SRC/$PATCHES_VER"]=1
-					prcfg=true
-					upped+=("$table_name")
+				sources["$raw_src/$p_ver"]=0
+				local last_patches=""
+				if [ "$host" = "gitlab" ]; then
+					local project_enc="${clean_src//\//%2F}"
+					local gl_rel="https://gitlab.com/api/v4/projects/${project_enc}/releases"
+					if [ "$p_ver" = "dev" ]; then
+						last_patches=$(req "$gl_rel" - | jq -e -r '.[0]') || continue
+					elif [ "$p_ver" = "latest" ]; then
+						last_patches=$(req "$gl_rel/permalink/latest" -) || continue
+					else
+						last_patches=$(req "$gl_rel/${p_ver}" -) || continue
+					fi
+					if ! last_patches=$(jq -e -r '.assets.links[]? | select(.name | (endswith("asc") or endswith("json")) | not) | .name' <<<"$last_patches"); then
+						continue
+					fi
 				else
-					echo "$OP" >>"$TEMP_DIR"/skipped
+					local rv_rel="https://api.github.com/repos/${clean_src}/releases"
+					if [ "$p_ver" = "dev" ]; then
+						last_patches=$(gh_req "$rv_rel" - | jq -e -r '.[0]') || continue
+					elif [ "$p_ver" = "latest" ]; then
+						last_patches=$(gh_req "$rv_rel/latest" -) || continue
+					else
+						last_patches=$(gh_req "$rv_rel/tags/${p_ver}" -) || continue
+					fi
+					if ! last_patches=$(jq -e -r '.assets[] | select(.name | (endswith("asc") or endswith("json")) | not) | .name' <<<"$last_patches"); then
+						continue
+					fi
+				fi
+
+				if [ -n "$last_patches" ]; then
+					if ! OP=$(grep "^Patches: ${org}/" build.md 2>/dev/null | grep -m1 "$last_patches"); then
+						sources["$raw_src/$p_ver"]=1
+						prcfg=true
+						upped+=("$table_name")
+					else
+						echo "$OP" >>"$TEMP_DIR"/skipped
+					fi
 				fi
 			fi
-		fi
+		done
 	done
+
 	if [ "$prcfg" = true ]; then
 		local query=""
 		for table in "${upped[@]}"; do
@@ -258,7 +438,6 @@ gh_dl() {
 
 log() { echo -e "$1  " >>"build.md"; }
 
-# Resolves the SIGPIPE broken pipe error that aborts GitHub Action workflows
 get_highest_ver() {
 	local vers m
 	vers=$(tee)
@@ -277,7 +456,6 @@ semver_validate() {
 	[[ ${#ac} -eq 0 ]]
 }
 
-# Integrated Upstream PR Changes
 get_patch_last_supported_ver() {
 	local list_patches=$1 pkg_name=$2 inc_sel=${3:-} is_experimental=${4:-false}
 	local op
@@ -298,21 +476,23 @@ get_patch_last_supported_ver() {
 			return
 		fi
 	fi
-	op=$(patches_list_versions "$cli_jar" "$patches_jar" "$pkg_name" "$is_experimental") || return 1
+	op=$(patches_list_versions "${args[cli]}" "${args[ptjar]}" "$pkg_name" "$is_experimental") || return 1
 	op=$(sed -n '/Most common compatible versions:/,$p' <<<"$op" | sed '1d' | awk '{$1=$1}1')
 	if [[ "$op" == "Any" ]]; then return; fi
 	pcount=$(head -1 <<<"$op") pcount=${pcount#*(} pcount=${pcount% *}
 	if [[ -z "$pcount" ]]; then
-		abort "No patches found for '$pkg_name' in patches '$patches_jar'"
+		if grep -Fq "$pkg_name" <<<"$list_patches"; then
+			return
+		else
+			abort "No patches found for '$pkg_name' in patches '${args[ptjar]}'"
+		fi
 	fi
 	grep -F "($pcount patch" <<<"$op" | sed 's/ (.* patch.*//' | get_highest_ver || return 1
 }
 
-# Integrated Upstream PR Changes
 patches_list_versions() {
-	local cli_jar=$1 patches_jar=$2 pkg_name=$3 is_experimental=$4 op cmd
-	local cmd_base="java -jar '$cli_jar' list-versions"
-
+	local cli_jar=$1 patches_jars=$2 pkg_name=$3 is_experimental=$4
+	local combined_op="" op="" cmd cmd_base="java -jar '$cli_jar' list-versions"
 	local cli_name
 	cli_name=$(basename "$cli_jar")
 	if [ "${cli_name::8}" = "revanced" ]; then
@@ -321,34 +501,46 @@ patches_list_versions() {
 		cmd_base+=" -x"
 	fi
 
-	cmd="${cmd_base} --patches='$patches_jar' -f '$pkg_name'"
-	if op=$(eval "$cmd" 2>&1); then
-		echo "$op"
-		return
-	fi
+	for pj in $patches_jars; do
+		cmd="${cmd_base} --patches='$pj' -f '$pkg_name'"
+		if op=$(eval "$cmd" 2>&1); then
+			combined_op+="$op"$'\n'
+			continue
+		fi
+		cmd="${cmd_base} '$pj' -f '$pkg_name'"
+		if op=$(eval "$cmd" 2>&1); then
+			combined_op+="$op"$'\n'
+		fi
+	done
 
-	cmd="${cmd_base} '$patches_jar' -f '$pkg_name'"
-	if op=$(eval "$cmd" 2>&1); then
-		echo "$op"
-		return
+	if [[ -n "$combined_op" ]]; then
+		echo "$combined_op"
+		return 0
 	fi
-
-	epr "Could not list versions ($pkg_name) $cli_jar: '$op'"
+	epr "Could not list versions ($pkg_name) $cli_jar"
 	return 1
 }
 
-# Integrated Upstream PR Changes
 patches_list() {
-	local cli_jar=$1 patches_jar=$2 pkg_name=$3 is_experimental=$4 op
-	if ! op=$(java -jar "$cli_jar" list-patches -p "$patches_jar" --filter-package-name "$pkg_name" --versions --packages -b 2>&1); then
-		local cmd="java -jar '$cli_jar' list-patches --patches '$patches_jar' -f '$pkg_name' --with-versions --with-packages"
-		if [ "$is_experimental" = "true" ]; then cmd+=" -x"; fi
-		if ! op=$(eval "$cmd" 2>&1); then
-			epr "Could not get patches list ($pkg_name) $cli_jar: '$op'"
-			return 1
+	local cli_jar=$1 patches_jars=$2 pkg_name=$3 is_experimental=$4
+	local combined_op="" op=""
+	for pj in $patches_jars; do
+		if op=$(java -jar "$cli_jar" list-patches -p "$pj" --filter-package-name "$pkg_name" --versions --packages -b 2>&1); then
+			combined_op+="$op"$'\n'
+		else
+			local cmd="java -jar '$cli_jar' list-patches --patches '$pj' -f '$pkg_name' --with-versions --with-packages"
+			if [ "$is_experimental" = "true" ]; then cmd+=" -x"; fi
+			if op=$(eval "$cmd" 2>&1); then
+				combined_op+="$op"$'\n'
+			fi
 		fi
+	done
+
+	if [[ -z "$combined_op" ]]; then
+		epr "Could not get patches list ($pkg_name) $cli_jar"
+		return 1
 	fi
-	echo "$op"
+	echo "$combined_op"
 }
 
 isoneof() {
@@ -380,7 +572,7 @@ setup_python_backend() {
 	mkdir -p "$TEMP_DIR"
 	if [ ! -f "$TEMP_DIR/network_engine.py" ]; then
 		export PIP_BREAK_SYSTEM_PACKAGES=1
-		python3 -m pip install -q "curl_cffi>=0.7.0" beautifulsoup4 urllib3 2>/dev/null || true
+		python3 -m pip install -q "curl_cffi>=0.7.0" beautifulsoup4 urllib3 requests 2>/dev/null || true
 		cat << 'EOF' > "$TEMP_DIR/network_engine.py"
 import sys, os, re, time, json, random
 from urllib.parse import urljoin
@@ -390,8 +582,9 @@ def log(msg):
     sys.stderr.flush()
 
 try:
-    from curl_cffi import requests
+    from curl_cffi import requests as cffi_requests
     from bs4 import BeautifulSoup
+    import requests
 except ImportError as e:
     log(f"Fatal Import Error: {e}. Missing dependencies.")
     if len(sys.argv) > 1 and sys.argv[1].endswith("_pkg"):
@@ -401,48 +594,111 @@ except ImportError as e:
 
 COOKIE_JAR = "/tmp/apkmirror_cookies.json"
 BROWSER_CFG = "/tmp/apkmirror_browser.txt"
+SOLVER_URL = os.getenv("CF_SOLVER_URL", "http://localhost:8000")
 
 class Scraper:
     def __init__(self):
         self.session = None
         self.current_browser = "chrome120"
         
+    def _create_session(self, browser):
+        sess = cffi_requests.Session(impersonate=browser)
+        sess.headers.update({
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1"
+        })
+        return sess
+
     def save_state(self):
         if self.session and self.current_browser:
             try:
                 with open(BROWSER_CFG, "w") as f: f.write(self.current_browser)
                 with open(COOKIE_JAR, "w") as f: json.dump(self.session.cookies.get_dict(), f)
-            except: pass
+            except Exception: pass
 
     def load_state(self):
         try:
             if os.path.exists(BROWSER_CFG) and os.path.exists(COOKIE_JAR):
                 with open(BROWSER_CFG, "r") as f: self.current_browser = f.read().strip()
-                self.session = requests.Session(impersonate=self.current_browser)
+                self.session = self._create_session(self.current_browser)
                 with open(COOKIE_JAR, "r") as f:
                     for k, v in json.load(f).items():
                         self.session.cookies.set(k, v)
                 return True
-        except: pass
+        except Exception: pass
         return False
 
     def clear_state(self):
         try:
             if os.path.exists(BROWSER_CFG): os.remove(BROWSER_CFG)
             if os.path.exists(COOKIE_JAR): os.remove(COOKIE_JAR)
-        except: pass
+        except Exception: pass
 
-    def get_soup(self, url, referer=None):
+    def _solve_via_docker_service(self, url):
+        try:
+            log(f"Attempting Cloudflare solve via local API for {url}...")
+            resp = requests.get(f"{SOLVER_URL}/cookies", params={"url": url}, timeout=60)
+            if resp.status_code != 200:
+                return False
+            data = resp.json()
+            cookies = data.get("cookies", {})
+            user_agent = data.get("user_agent")
+            if not cookies or not user_agent:
+                return False
+
+            self.clear_state()
+            self.current_browser = "chrome120"
+            sess = self._create_session("chrome120")
+            
+            if isinstance(cookies, dict):
+                for k, v in cookies.items():
+                    sess.cookies.set(k, v)
+            elif isinstance(cookies, list):
+                for c in cookies:
+                    if isinstance(c, dict) and "name" in c and "value" in c:
+                        sess.cookies.set(c["name"], c["value"])
+
+            sess.headers["User-Agent"] = user_agent
+            self.session = sess
+            self.save_state()
+            log("Cloudflare bypass cookies synchronized successfully.")
+            return True
+        except Exception:
+            return False
+
+    def is_challenge(self, r):
+        if not r: return True
+        if r.status_code in (403, 503, 429): return True
+        body = (r.text or "").lower()
+        return "cf-browser-verification" in body or "just a moment" in body or "attention required" in body
+
+    def get_soup(self, url, referer=None, force_solve=False):
         headers = {"Referer": referer} if referer else {}
-        time.sleep(random.uniform(2.0, 4.0))
+        time.sleep(random.uniform(1.5, 3.0))
         
-        if self.load_state() or self.session:
+        if not force_solve and (self.load_state() or self.session):
             try:
                 r = self.session.get(url, headers=headers, timeout=20, allow_redirects=True)
-                if r.status_code < 400 and "cf-browser-verification" not in r.text and "Just a moment" not in r.text:
+                if not self.is_challenge(r):
                     self.save_state()
                     return BeautifulSoup(r.text, 'html.parser'), r
-            except Exception as e:
+            except Exception:
+                pass
+
+        if force_solve or self._solve_via_docker_service(url):
+            if force_solve:
+                self._solve_via_docker_service(url)
+            try:
+                r = self.session.get(url, headers=headers, timeout=20, allow_redirects=True)
+                if not self.is_challenge(r):
+                    self.save_state()
+                    return BeautifulSoup(r.text, 'html.parser'), r
+            except Exception:
                 pass
 
         self.clear_state()
@@ -451,18 +707,18 @@ class Scraper:
         
         for browser in browsers:
             try:
-                time.sleep(random.uniform(3.5, 6.0))
-                new_session = requests.Session(impersonate=browser)
+                time.sleep(random.uniform(2.5, 4.5))
+                new_session = self._create_session(browser)
                 r = new_session.get(url, headers=headers, timeout=20, allow_redirects=True)
                 
-                if r.status_code in (403, 503) or "Just a moment" in r.text or "cf-browser-verification" in r.text:
+                if self.is_challenge(r):
                     continue
                     
                 self.session = new_session
                 self.current_browser = browser
                 self.save_state()
                 return BeautifulSoup(r.text, 'html.parser'), r
-            except Exception as e:
+            except Exception:
                 time.sleep(1)
                 
         log("All browsers failed Cloudflare checks.")
@@ -489,13 +745,125 @@ def main():
     
     scraper = Scraper()
     
-    if mode == "apkmirror_pkg":
+    # ------------------ GITHUB HANDLERS ------------------
+    if mode.startswith("github_"):
+        gh_token = os.environ.get("GITHUB_TOKEN", "")
+        gh_headers = {"User-Agent": "Morphe-DeVanced-Builder"}
+        if gh_token:
+            gh_headers["Authorization"] = f"token {gh_token}"
+
+        gh_match = re.search(r"github\.com/([^/]+)/([^/]+)/releases/tags?/([^/]+)", url)
+        if not gh_match:
+            log(f"Invalid GitHub release URL: {url}")
+            sys.exit(1)
+
+        owner, repo, tag = gh_match.groups()
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
+
+        try:
+            r = requests.get(api_url, headers=gh_headers, timeout=20)
+            if r.status_code != 200:
+                log(f"GitHub API error {r.status_code}: {r.text}")
+                sys.exit(1)
+            release_data = r.json()
+        except Exception as e:
+            log(f"Failed to fetch GitHub release: {e}")
+            sys.exit(1)
+
+        arch_suffix = re.compile(r"(?:-(all|arm64-v8a|armeabi-v7a|x86_64|x86))?(?:\.apk\.apkm|\.apk|\.apkm)$", re.I)
+
+        if mode == "github_pkg":
+            pkg_name = release_data.get("name") or release_data.get("tag_name") or "UNKNOWN"
+            print(f"PKG:{pkg_name}")
+
+        elif mode == "github_vers":
+            pkg_name = release_data.get("name") or release_data.get("tag_name") or ""
+            prefix = f"{pkg_name}-"
+            seen = {}
+            for asset in release_data.get("assets", []):
+                name = asset.get("name", "")
+                if name.startswith(prefix) and name.endswith((".apk", ".apkm")):
+                    ver = arch_suffix.sub("", name[len(prefix):])
+                    seen[ver] = None
+            versions = list(seen.keys()) or [release_data.get("tag_name", "")]
+            for v in versions:
+                if v:
+                    print(v)
+
+        elif mode == "github_dl":
+            version = sys.argv[3] if len(sys.argv) > 3 else ""
+            dest_path = sys.argv[4] if len(sys.argv) > 4 else ""
+            arch = sys.argv[5] if len(sys.argv) > 5 else "all"
+            dpi = sys.argv[6] if len(sys.argv) > 6 else ""
+
+            if arch == "arm-v7a":
+                arch = "armeabi-v7a"
+            version_f = version.replace(" ", "").lstrip("v")
+
+            apk_assets = [a for a in release_data.get("assets", []) if a.get("name", "").endswith((".apk", ".apkm"))]
+            target_asset = None
+
+            for a in apk_assets:
+                name = a.get("name", "")
+                if version_f and version_f not in name:
+                    continue
+
+                m = arch_suffix.search(name)
+                file_arch = m.group(1).lower() if m and m.group(1) else "all"
+                if arch in ("all", "both"):
+                    if file_arch != "all":
+                        continue
+                else:
+                    if file_arch not in (arch, "all"):
+                        continue
+
+                target_asset = a
+                break
+
+            if not target_asset:
+                for a in apk_assets:
+                    if version_f and version_f in a.get("name", ""):
+                        target_asset = a
+                        break
+
+            if not target_asset and apk_assets:
+                target_asset = apk_assets[0]
+
+            if not target_asset:
+                log(f"No matching GitHub asset found for arch '{arch}' and version '{version}'")
+                sys.exit(1)
+
+            dl_url = target_asset.get("browser_download_url")
+            is_bundle = target_asset.get("name", "").endswith(".apkm")
+            real_dest = f"{dest_path}.apkm" if is_bundle else dest_path
+
+            log(f"Downloading GitHub asset: {target_asset.get('name')}")
+            dl_headers = gh_headers.copy()
+            dl_headers["Accept"] = "application/octet-stream"
+
+            r_file = requests.get(dl_url, headers=dl_headers, timeout=300, allow_redirects=True)
+            if r_file.status_code == 200 and r_file.content.startswith(b"PK"):
+                with open(real_dest, "wb") as f:
+                    f.write(r_file.content)
+                with open(f"{dest_path}.is_bundle", "w") as f:
+                    f.write("true" if is_bundle else "false")
+                log("SUCCESS")
+            else:
+                log(f"Download failed. HTTP {r_file.status_code}")
+                sys.exit(1)
+
+    # ------------------ APKMIRROR HANDLERS ------------------
+    elif mode == "apkmirror_pkg":
         resolved_pkg = None
         if "youtube-music" in url: resolved_pkg = "com.google.android.apps.youtube.music"
         elif "youtube" in url: resolved_pkg = "com.google.android.youtube"
         elif "photos" in url: resolved_pkg = "com.google.android.apps.photos"
         elif "reddit" in url: resolved_pkg = "com.reddit.frontpage"
         elif "twitter" in url or "x-corp" in url: resolved_pkg = "com.twitter.android"
+        elif "messenger" in url: resolved_pkg = "com.facebook.orca"
+        elif "facebook" in url: resolved_pkg = "com.facebook.katana"
+        elif "threads" in url: resolved_pkg = "com.instagram.barcelona"
+        elif "instagram" in url: resolved_pkg = "com.instagram.android"
 
         soup, r = scraper.get_soup(url)
         if r and r.text:
@@ -509,8 +877,8 @@ def main():
         cat = url.rstrip("/").split("/")[-1]
         soup, _ = scraper.get_soup(f"https://www.apkmirror.com/uploads/?appcategory={cat}")
         if soup:
-            for a in soup.find_all("a", href=re.compile(r"-release/$")):
-                txt = a.text.strip()
+            for a in soup.select("#primary a.fontBlack[href*='-release/']"):
+                txt = a.get_text(strip=True)
                 if txt and "beta" not in txt.lower() and "alpha" not in txt.lower():
                     print(txt.split()[-1])
 
@@ -521,35 +889,28 @@ def main():
         cat = url.rstrip("/").split("/")[-1]
         log(f"Searching APKMirror for version {version} ({cat})")
         
-        search_term = version.split("-")[0].strip()
-        search_url = f"https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s={cat}+{search_term}"
-        
+        search_url = f"{url.rstrip('/')}/?s={version}"
         soup_search, _ = scraper.get_soup(search_url)
         if not soup_search: 
             sys.exit(1)
         
         release_url = None
-        clean_target = re.sub(r'[^a-zA-Z0-9]', '', version.lower())
-        
-        for a in soup_search.find_all("a", href=re.compile(r"-release/$")):
-            txt = a.text.strip()
-            href = a.get("href", "")
-            
-            clean_slug = re.sub(r'[^a-zA-Z0-9]', '', href.lower())
-            clean_txt = re.sub(r'[^a-zA-Z0-9]', '', txt.lower())
-            
-            if clean_target in clean_slug or clean_target in clean_txt:
-                release_url = urljoin("https://www.apkmirror.com", href)
+        for a in soup_search.select("a.fontBlack[href*='-release/']"):
+            if version in a.get_text() and f"/{cat}/" in a.get("href", ""):
+                release_url = urljoin("https://www.apkmirror.com", a["href"])
                 break
                 
         if not release_url:
+            log("APKMirror release URL not found via app search.")
             sys.exit(1)
             
         soup_rel, r_rel = scraper.get_soup(release_url, referer=search_url)
         if not soup_rel:
             sys.exit(1)
             
-        rows = [r for r in soup_rel.select("div.table-row") if len(r.select("div.table-cell")) >= 4]
+        rows = soup_rel.select("div.table-row.headerFont")
+        if not rows:
+            rows = [r for r in soup_rel.select("div.table-row") if len(r.select("div.table-cell")) >= 4]
         
         apparch = {"universal", "noarch", "arm64-v8a + armeabi-v7a", "arm64-v8a + armeabi"}
         if arch != "all": apparch.add(arch)
@@ -560,6 +921,7 @@ def main():
         for target_type in ["APK", "BUNDLE"]:
             for row in reversed(rows):
                 cells = row.select("div.table-cell")
+                if len(cells) < 4: continue
                 badge = cells[0].select_one(".apkm-badge")
                 b_type = badge.get_text(strip=True).upper() if badge else "APK"
                 
@@ -568,7 +930,7 @@ def main():
                 arch_text = cells[1].get_text(strip=True)
                 dpi_text = cells[3].get_text(strip=True)
                 
-                dpi_ok = not dpi_text or "nodpi" in dpi_text or "anydpi" in dpi_text or (dpi and dpi in dpi_text)
+                dpi_ok = not dpi_text or re.match(r"\d+-640dpi", dpi_text) or dpi_text in {"nodpi", "anydpi"} or (dpi and dpi in dpi_text)
                 if arch_text in apparch and dpi_ok:
                     link = row.find("a", href=re.compile(r"/download/")) or cells[0].find("a")
                     if link and link.get("href"):
@@ -600,6 +962,7 @@ def main():
         final_download_url = urljoin("https://www.apkmirror.com", dl_link["href"])
         scraper.download(final_download_url, dest_path, is_bundle, btn_url)
 
+    # ------------------ UPTODOWN HANDLERS ------------------
     elif mode == "uptodown_pkg":
         resolved_pkg = None
         if "youtube-music" in url: resolved_pkg = "com.google.android.apps.youtube.music"
@@ -607,12 +970,22 @@ def main():
         elif "photos" in url: resolved_pkg = "com.google.android.apps.photos"
         elif "reddit" in url: resolved_pkg = "com.reddit.frontpage"
         elif "twitter" in url or "x-corp" in url: resolved_pkg = "com.twitter.android"
+        elif "messenger" in url: resolved_pkg = "com.facebook.orca"
+        elif "facebook" in url: resolved_pkg = "com.facebook.katana"
+        elif "threads" in url: resolved_pkg = "com.instagram.barcelona"
+        elif "instagram" in url: resolved_pkg = "com.instagram.android"
 
         soup, _ = scraper.get_soup(f"{url}/download")
         if soup:
-            th = soup.find("th", string=re.compile("Package Name", re.I))
+            th = soup.find(lambda e: e.name in ("th", "td") and "package name" in e.text.lower())
             if th and th.find_next_sibling("td"):
-                print(f"PKG:{th.find_next_sibling('td').get_text(strip=True)}")
+                pkg = th.find_next_sibling("td").get_text(strip=True)
+                if pkg and "." in pkg:
+                    print(f"PKG:{pkg}")
+                    return
+            m = re.search(r'play\.google\.com/store/apps/details\?id=([\w.]+)', str(soup))
+            if m:
+                print(f"PKG:{m.group(1)}")
                 return
         print(f"PKG:{resolved_pkg}" if resolved_pkg else "PKG:UNKNOWN")
 
@@ -627,17 +1000,30 @@ def main():
         if arch == "arm-v7a": arch = "armeabi-v7a"
         
         soup, _ = scraper.get_soup(f"{url}/versions")
-        if not soup:
-            log(f"Uptodown versions page failed to load for {url}")
-            sys.exit(1)
         
-        detail_app = soup.select_one("#detail-app-name")
-        if not detail_app or "data-code" not in detail_app.attrs:
-            log(f"Detail app name not found on Uptodown page for {url}")
+        def get_data_code(s):
+            if not s: return None
+            detail_app = s.select_one("#detail-app-name")
+            if detail_app and "data-code" in detail_app.attrs:
+                return detail_app["data-code"]
+            elem = s.find(attrs={"data-code": True})
+            if elem:
+                return elem["data-code"]
+            m = re.search(r'data-code=["\'](\d+)["\']', str(s))
+            if m:
+                return m.group(1)
+            return None
+
+        data_code = get_data_code(soup)
+        if not data_code:
+            log(f"Uptodown data-code not found, forcing Cloudflare solver for {url}...")
+            soup, _ = scraper.get_soup(f"{url}/versions", force_solve=True)
+            data_code = get_data_code(soup)
+
+        if not data_code:
+            log(f"Detail app data-code not found on Uptodown page for {url}")
             sys.exit(1)
             
-        data_code = detail_app["data-code"]
-        
         ver_url_data = None
         is_bundle = False
         for i in range(1, 21):
@@ -689,7 +1075,7 @@ def main():
                     try:
                         matched_id = child.select_one(".v-report")["data-file-id"]
                         break
-                    except: continue
+                    except Exception: continue
 
             if matched_id:
                 soup_ver, _ = scraper.get_soup(f"{url}/download/{matched_id}-x")
@@ -714,6 +1100,35 @@ run_python_backend() {
 
 setup_python_backend
 
+# -------------------- github wrappers --------------------
+get_github_resp() {
+	__GITHUB_URL__="${1%/}"
+	__GITHUB_RESP__=$(run_python_backend "github_pkg" "$__GITHUB_URL__") || return 1
+}
+
+get_github_pkg_name() { 
+	local pkg=$(grep -oP '^PKG:\K.*' <<<"${__GITHUB_RESP__:-}" | head -1)
+	echo "${pkg:-UNKNOWN}"
+}
+
+get_github_vers() { 
+	run_python_backend "github_vers" "${__GITHUB_URL__:-}"
+}
+
+dl_github() {
+	local url="${1%/}" version=$2 output=$3 arch=$4 dpi=$5
+	rm -f "${output}.is_bundle" "${output}.apkm.is_bundle"
+
+	if ! run_python_backend "github_dl" "$url" "$version" "$output" "$arch" "$dpi" >/dev/null; then
+		return 1
+	fi
+
+	if [[ -f "${output}.is_bundle" && "$(cat "${output}.is_bundle")" == "true" ]] || [[ -f "${output}.apkm.is_bundle" ]]; then
+		merge_splits "${output}.apkm" "${output}"
+	fi
+	[[ -f "$output" ]]
+}
+
 # -------------------- apkmirror wrappers --------------------
 get_apkmirror_resp() {
 	__APKMIRROR_URL__="${1%/}"
@@ -722,7 +1137,7 @@ get_apkmirror_resp() {
 }
 
 get_apkmirror_pkg_name() { 
-	local pkg=$(grep -oP '^PKG:\K.*' <<<"$__APKMIRROR_RESP__" | head -1)
+	local pkg=$(grep -oP '^PKG:\K.*' <<<"${__APKMIRROR_RESP__:-}" | head -1)
 	if [ -z "$pkg" ] || [ "$pkg" = "UNKNOWN" ]; then
 		case "${__APKMIRROR_URL__,,}" in
 			*youtube-music*) pkg="com.google.android.apps.youtube.music" ;;
@@ -730,12 +1145,16 @@ get_apkmirror_pkg_name() {
 			*photos*) pkg="com.google.android.apps.photos" ;;
 			*reddit*) pkg="com.reddit.frontpage" ;;
 			*twitter*|*x*) pkg="com.twitter.android" ;;
+			*messenger*) pkg="com.facebook.orca" ;;
+			*facebook*) pkg="com.facebook.katana" ;;
+			*threads*) pkg="com.instagram.barcelona" ;;
+			*instagram*) pkg="com.instagram.android" ;;
 		esac
 	fi
 	echo "${pkg:-UNKNOWN}"
 }
 
-get_apkmirror_vers() { run_python_backend "apkmirror_vers" "$__APKMIRROR_URL__"; }
+get_apkmirror_vers() { run_python_backend "apkmirror_vers" "${__APKMIRROR_URL__:-}"; }
 
 dl_apkmirror() {
 	local url="${1%/}" version=$2 output=$3 arch=$4 dpi=$5
@@ -762,7 +1181,7 @@ get_uptodown_resp() {
 }
 
 get_uptodown_pkg_name() { 
-	local pkg=$(grep -oP '^PKG:\K.*' <<<"$__UPTODOWN_RESP__" | head -1)
+	local pkg=$(grep -oP '^PKG:\K.*' <<<"${__UPTODOWN_RESP__:-}" | head -1)
 	if [ -z "$pkg" ] || [ "$pkg" = "UNKNOWN" ]; then
 		case "${__UPTODOWN_URL__,,}" in
 			*youtube-music*) pkg="com.google.android.apps.youtube.music" ;;
@@ -770,12 +1189,16 @@ get_uptodown_pkg_name() {
 			*photos*) pkg="com.google.android.apps.photos" ;;
 			*reddit*) pkg="com.reddit.frontpage" ;;
 			*twitter*|*x*) pkg="com.twitter.android" ;;
+			*messenger*) pkg="com.facebook.orca" ;;
+			*facebook*) pkg="com.facebook.katana" ;;
+			*threads*) pkg="com.instagram.barcelona" ;;
+			*instagram*) pkg="com.instagram.android" ;;
 		esac
 	fi
 	echo "${pkg:-UNKNOWN}"
 }
 
-get_uptodown_vers() { run_python_backend "uptodown_vers" "$__UPTODOWN_URL__"; }
+get_uptodown_vers() { run_python_backend "uptodown_vers" "${__UPTODOWN_URL__:-}"; }
 
 dl_uptodown() {
 	local url="${1%/}" version=$2 output=$3 arch=$4 dpi=$5
@@ -802,115 +1225,36 @@ dl_archive() {
 		return 0
 	fi
 
-	path=$(grep -m1 "${version_f}-${arch// /}" <<<"$__ARCHIVE_RESP__" || grep -m1 "${version_f}" <<<"$__ARCHIVE_RESP__") || return 1
-	if [[ "${path##*.}" == "apkm" ]]; then output_m="${output}.apkm"; else output_m=$output; fi
-	_req "${url}/${path}" "$output_m" || return 1
-	if [[ "${path##*.}" == "apkm" ]]; then merge_splits "$output_m" "$output"; fi
+	local arch_query="${arch// /}"
+	if [ "$arch_query" = "arm-v7a" ]; then arch_query="armeabi-v7a"; fi
+
+	if ! path=$(grep -m1 "${version_f}-${arch_query}" <<<"${__ARCHIVE_RESP__:-}"); then
+		if ! path=$(grep -m1 "${version_f}-${arch// /}" <<<"${__ARCHIVE_RESP__:-}"); then
+			path=$(grep -m1 "${version_f}-all" <<<"${__ARCHIVE_RESP__:-}") || return 1
+		fi
+	fi
+
+	if [ "${path##*.}" = "apkm" ]; then
+		req "${url}/${path}" "${output}.apkm" || return 1
+		merge_splits "${output}.apkm" "$output"
+	else
+		req "${url}/${path}" "${output}" || return 1
+	fi
 }
 get_archive_resp() {
 	local r
-	r=$(req "$1" -)
-	if [ -z "$r" ]; then return 1; else __ARCHIVE_RESP__=$(sed -n 's;^<a href="\(.*\)"[^"]*;\1;p' <<<"$r"); fi
+	r=$(req "$1" -) || return 1
+	__ARCHIVE_RESP__=$(sed -n 's;^<a href="\(.*\)"[^"]*;\1;p' <<<"$r")
 	__ARCHIVE_PKG_NAME__=$(awk -F/ '{print $NF}' <<<"$1")
 }
-get_archive_vers() { sed 's/^[^-]*-//;s/-\(all\|arm64-v8a\|arm-v7a\)\.apk//g' <<<"$__ARCHIVE_RESP__"; }
-get_archive_pkg_name() { echo "$__ARCHIVE_PKG_NAME__"; }
-
-# -------------------- github --------------------
-get_github_resp() {
-	local url=$1 owner repo tag api_url
-	if [[ "$url" =~ github\.com/([^/]+)/([^/]+)/releases/tag/([^/]+) ]]; then
-		owner="${BASH_REMATCH[1]}"
-		repo="${BASH_REMATCH[2]}"
-		tag="${BASH_REMATCH[3]}"
-	else
-		return 1
-	fi
-	api_url="https://api.github.com/repos/${owner}/${repo}/releases/tags/${tag}"
-	__GITHUB_RESP__=$(gh_req "$api_url" -) || return 1
-}
-get_github_vers() {
-	local name prefix ver versions=()
-	name=$(jq -r '.name // empty' <<<"$__GITHUB_RESP__")
-	[[ -z "$name" ]] && jq -r '.tag_name' <<<"$__GITHUB_RESP__" && return
-	prefix="${name}-"
-	
-	while read -r asset_name; do
-		[[ ! "$asset_name" =~ \.(apk|apkm)$ ]] && continue
-		[[ "$asset_name" != "$prefix"* ]] && continue
-		ver="${asset_name#"$prefix"}"
-		ver=$(sed -E 's/(-(all|arm64-v8a|armeabi-v7a|x86_64|x86))?(\.apk\.apkm|\.apk|\.apkm)$//I' <<<"$ver")
-		versions+=("$ver")
-	done < <(jq -r '.assets[].name' <<<"$__GITHUB_RESP__")
-	
-	if [[ ${#versions[@]} -eq 0 ]]; then
-		jq -r '.tag_name' <<<"$__GITHUB_RESP__"
-	else
-		echo "${versions[@]}" | tr ' ' '\n' | sort -u
-	fi
-}
-get_github_pkg_name() { jq -r '.name // .tag_name' <<<"$__GITHUB_RESP__"; }
-dl_github() {
-	local url=$1 version=$2 output=$3 arch=$4 dpi=$5 is_bundle=false
-	local version_f asset matches=() target_asset=""
-	version_f=$(echo "${version// /}" | sed 's/^v//')
-
-	if [[ "$arch" == "arm-v7a" ]]; then arch="armeabi-v7a"; fi
-
-	while read -r row; do
-		local name url_dl
-		name=$(cut -f1 <<<"$row")
-		url_dl=$(cut -f2 <<<"$row")
-		[[ ! "$name" =~ \.(apk|apkm)$ ]] && continue
-		if [[ -n "$version_f" && "$name" != *"$version_f"* ]]; then continue; fi
-		
-		local file_arch="all"
-		if [[ "$name" =~ -(all|arm64-v8a|armeabi-v7a|x86_64|x86) ]]; then
-			file_arch="${BASH_REMATCH[1]}"
-		fi
-
-		if [[ "$arch" == "all" || "$arch" == "both" ]]; then
-			[[ "$file_arch" == "all" ]] && matches+=("$name|$url_dl")
-		else
-			{ [[ "$file_arch" == "$arch" ]] || [[ "$file_arch" == "all" ]]; } && matches+=("$name|$url_dl")
-		fi
-	done < <(jq -r '.assets[] | \(.name)\t\(.browser_download_url)' <<<"$__GITHUB_RESP__")
-
-	for pair in "${matches[@]}"; do
-		local n="${pair%%|*}" u="${pair#*|}"
-		if [[ "$n" =~ -"$arch" ]] && [[ "$n" =~ \.apk$ ]]; then
-			target_asset="$u"; [[ "$n" == "*.apkm" ]] && is_bundle=true; break
-		fi
-	done
-	if [[ -z "$target_asset" ]]; then
-		for pair in "${matches[@]}"; do
-			local n="${pair%%|*}" u="${pair#*|}"
-			if [[ "$n" =~ \.apk$ ]]; then
-				target_asset="$u"; break
-			fi
-		done
-	fi
-	if [[ -z "$target_asset" && ${#matches[@]} -gt 0 ]]; then
-		local pair="${matches[0]}"
-		local n="${pair%%|*}" u="${pair#*|}"
-		target_asset="$u"
-		[[ "$n" == *.apkm ]] && is_bundle=true
-	fi
-
-	if [[ -z "$target_asset" ]]; then epr "No matching asset variant found on GitHub Release"; return 1; fi
-
-	if [[ "$is_bundle" == true ]]; then
-		gh_dl "${output}.apkm" "$target_asset" || return 1
-		merge_splits "${output}.apkm" "${output}"
-	else
-		gh_dl "${output}" "$target_asset" || return 1
-	fi
-}
+get_archive_vers() { sed 's/^[^-]*-//;s/-\(all\|arm64-v8a\|arm-v7a\|armeabi-v7a\|x86_64\|x86\)\.apk//g' <<<"${__ARCHIVE_RESP__:-}"; }
+get_archive_pkg_name() { echo "${__ARCHIVE_PKG_NAME__:-UNKNOWN}"; }
 
 # -------------------- direct --------------------
 dl_direct() {
 	local url=$1 version=${2// /-} output=$3 arch=$4 _dpi=$5
-	if ! grep -q "${version_f#v}-${arch// /}" <<<"$url"; then
+	local version_f=${version#v}
+	if ! grep -q "${version_f}-${arch// /}" <<<"$url"; then
 		epr "Given direct-dlurl for $output is not compatible. Set proper 'arch' and 'version' options."
 		return 1
 	fi
@@ -921,17 +1265,22 @@ dl_direct() {
 		req "$url" "${output}" || return 1
 	fi
 }
-get_direct_vers() { cut -d- -f2 <<<"$__DIRECT_APKNAME__"; }
-get_direct_pkg_name() { cut -d- -f1 <<<"$__DIRECT_APKNAME__"; }
+get_direct_vers() { cut -d- -f2 <<<"${__DIRECT_APKNAME__:-}"; }
+get_direct_pkg_name() { cut -d- -f1 <<<"${__DIRECT_APKNAME__:-}"; }
 get_direct_resp() { __DIRECT_APKNAME__=$(awk -F/ '{print $NF}' <<<"$1"); }
 # --------------------------------------------------
 
 patch_apk() {
-	local stock_input=$1 patched_apk=$2 patcher_args=$3 cli_jar=$4 patches_jar=$5
+	local stock_input=$1 patched_apk=$2 patcher_args=$3 cli_jar=$4 patches_jars=$5
 	local tmp_files
 	tmp_files="$(pwd)/$(mktemp -d -p "$TEMP_DIR")"
 
-	local cmd="java -jar '$cli_jar' patch '$stock_input' -o '$patched_apk' -p '$patches_jar' --keystore=ks.keystore \
+	local p_flags=()
+	for pj in $patches_jars; do
+		p_flags+=("-p" "$pj")
+	done
+
+	local cmd="java -jar '$cli_jar' patch '$stock_input' -o '$patched_apk' "${p_flags[@]}" --keystore=ks.keystore \
     --keystore-entry-password=123456789 --keystore-password=123456789 --signer=jhc --keystore-entry-alias=jhc -t '$patched_apk-tmp' $patcher_args"
 
 	local cli_name
@@ -1022,9 +1371,33 @@ build_rv() {
 
 	if [[ $get_latest_ver == true ]]; then
 		if [[ "$version_mode" == beta ]]; then __AAV__="true"; else __AAV__="false"; fi
-		pkgvers=$(get_"${dl_from}"_vers)
-		version=$(get_highest_ver <<<"$pkgvers") || version=$(head -1 <<<"$pkgvers")
+		
+		# Scan through sources in priority order to securely fetch the latest version
+		for dl_p in "${DL_SRCS[@]}"; do
+			if [[ -n "${args[${dl_p}_dlurl]:-}" ]]; then
+				dl_from=$dl_p
+				
+				# Initialize the URL variable to prevent unbound variable errors
+				if [[ "$dl_p" == "apkmirror" ]]; then __APKMIRROR_URL__="${args[${dl_p}_dlurl]}"
+				elif [[ "$dl_p" == "uptodown" ]]; then __UPTODOWN_URL__="${args[${dl_p}_dlurl]}"
+				elif [[ "$dl_p" == "github" ]]; then __GITHUB_URL__="${args[${dl_p}_dlurl]}"
+				elif [[ "$dl_p" == "archive" ]]; then __ARCHIVE_URL__="${args[${dl_p}_dlurl]}"
+				elif [[ "$dl_p" == "direct" ]]; then __DIRECT_APKNAME__=$(awk -F/ '{print $NF}' <<<"${args[${dl_p}_dlurl]}"); fi
+				
+				if ! get_${dl_p}_resp "${args[${dl_p}_dlurl]}"; then
+					continue
+				fi
+				pkgvers=$(get_"${dl_from}"_vers)
+				version=$(get_highest_ver <<<"$pkgvers") || version=$(head -1 <<<"$pkgvers")
+				
+				# Break out of the loop once a valid version is found
+				if [[ -n "$version" ]]; then 
+					break
+				fi
+			fi
+		done
 	fi
+	
 	if [[ -z "$version" ]]; then
 		epr "empty version, not building ${table}."
 		return 0
@@ -1160,7 +1533,12 @@ build_rv() {
 
 		module_config "$base_template" "$pkg_name" "$version" "$arch"
 
-		local patches_ver="${args[ptjar]##*-}"
+		local p_vers=()
+		for pj in ${args[ptjar]}; do
+			p_vers+=("${pj##*-}")
+		done
+		local patches_ver="${p_vers[*]}"
+
 		module_prop \
 			"${args[module_prop_name]:-}" \
 			"${app_name} ${args[rv_brand]:-}" \
