@@ -157,10 +157,19 @@ get_prebuilts() {
 			if [[ "$(jq 'length' <<<"$matches")" -eq 0 ]]; then
 				epr "No patch asset was found for ${raw_p_src}"
 				return 1
+			elif [[ "$(jq 'length' <<<"$matches")" -gt 1 ]]; then
+				wpr "More than 1 patch asset was found for ${raw_p_src}. Falling back to the first one found..."
 			fi
 
 			asset=$(jq -r ".[0]" <<<"$matches")
 			name=$(jq -r '.name' <<<"$asset")
+
+			if [[ ! "$name" =~ [0-9] ]]; then
+				local name_only="${name%.*}"
+				local name_ext="${name##*.}"
+				name="${name_only}-${tag_name#v}.${name_ext}"
+			fi
+
 			file="${dir}/${name}"
 
 			if [ "$host" = "gitlab" ]; then
@@ -173,19 +182,28 @@ get_prebuilts() {
 				url=$(jq -r '.url' <<<"$asset")
 				gh_dl "$file" >&2 "$url" || return 1
 			fi
-			echo "Patches: ${org}/${name}  " >>"${dir}/changelog.md"
 		else
 			grab_cl=false
 			name=$(basename "$file")
-			tag_name=$(cut -d'-' -f3- <<<"$name")
-			tag_name=v${tag_name%.*}
+			local v_extracted
+			v_extracted=$(grep -oE '[0-9]+(\.[0-9]+)+(-[a-zA-Z0-9.]+)?' <<<"$name" | head -1 || true)
+			if [[ -n "$v_extracted" ]]; then
+				tag_name="v${v_extracted#v}"
+			else
+				tag_name=$(cut -d'-' -f2- <<<"$name")
+				tag_name=v${tag_name%.*}
+			fi
 		fi
 
 		if [[ "$grab_cl" == true ]]; then
+			local cl_str=""
 			if [ "$host" = "gitlab" ]; then
-				echo -e "[Changelog](https://gitlab.com/${clean_src}/-/releases/${tag_name})\n" >>"${dir}/changelog.md"
+				cl_str="⚙️ » Patches: \`${org}/${name}\` ([Changelog](https://gitlab.com/${clean_src}/-/releases/${tag_name}))"
 			else
-				echo -e "[Changelog](https://github.com/${clean_src}/releases/tag/${tag_name})\n" >>"${dir}/changelog.md"
+				cl_str="⚙️ » Patches: \`${org}/${name}\` ([Changelog](https://github.com/${clean_src}/releases/tag/${tag_name}))"
+			fi
+			if ! grep -qF "\`${org}/${name}\`" "${TEMP_DIR}/patches_changelog.md" 2>/dev/null; then
+				echo "$cl_str" >>"${TEMP_DIR}/patches_changelog.md"
 			fi
 		fi
 
@@ -243,7 +261,7 @@ get_prebuilts() {
 	fi
 
 	if [[ -z "$cli_file" ]]; then
-		local resp="" matches="" asset="" name=""
+		local resp="" matches="" asset="" name="" tag_name=""
 		if [ "$cli_host" = "gitlab" ]; then
 			local project_enc="${clean_cli//\//%2F}"
 			local gl_rel="https://gitlab.com/api/v4/projects/${project_enc}/releases"
@@ -256,6 +274,7 @@ get_prebuilts() {
 			else
 				resp=$(req "${gl_rel}/${cli_ver}" -) || return 1
 			fi
+			tag_name=$(jq -r '.tag_name // empty' <<<"$resp") || return 1
 			matches=$(jq -e '.assets.links // [] | map(select(.name | (endswith("asc") or endswith("json")) | not))' <<<"$resp" 2>/dev/null || jq -e '.assets // []' <<<"$resp") || return 1
 		else
 			local gh_rel="https://api.github.com/repos/${clean_cli}/releases"
@@ -269,6 +288,7 @@ get_prebuilts() {
 				gh_rel+="/tags/${cli_ver}"
 			fi
 			resp=$(gh_req "$gh_rel" -) || return 1
+			tag_name=$(jq -r '.tag_name' <<<"$resp") || return 1
 			matches=$(jq -e '.assets | map(select(.name | (endswith("asc") or endswith("json")) | not))' <<<"$resp") || return 1
 		fi
 
@@ -283,10 +303,19 @@ get_prebuilts() {
 		if [[ "$(jq 'length' <<<"$matches")" -eq 0 ]]; then
 			epr "No CLI asset was found for ${cli_src}"
 			return 1
+		elif [[ "$(jq 'length' <<<"$matches")" -gt 1 ]]; then
+			wpr "More than 1 CLI asset was found for ${cli_src}. Falling back to the first one found..."
 		fi
 
 		asset=$(jq -r ".[0]" <<<"$matches")
 		name=$(jq -r '.name' <<<"$asset")
+
+		if [[ ! "$name" =~ [0-9] ]]; then
+			local name_only="${name%.*}"
+			local name_ext="${name##*.}"
+			name="${name_only}-${tag_name#v}.${name_ext}"
+		fi
+
 		cli_file="${cli_dir}/${name}"
 
 		if [ "$cli_host" = "gitlab" ]; then
@@ -299,7 +328,12 @@ get_prebuilts() {
 			url=$(jq -r '.url' <<<"$asset")
 			gh_dl "$cli_file" >&2 "$url" || return 1
 		fi
-		echo "CLI: ${cli_org}/${name}  " >>"${cli_dir}/changelog.md"
+	else
+		name=$(basename "$cli_file")
+	fi
+
+	if ! grep -qF "CLI: \`${cli_org}/${name}\`" "${TEMP_DIR}/cli_changelog.md" 2>/dev/null; then
+		echo "⚙️ » CLI: \`${cli_org}/${name}\`" >>"${TEMP_DIR}/cli_changelog.md"
 	fi
 
 	echo "${collected_patch_files[*]} ${cli_file}"
@@ -352,7 +386,7 @@ config_update() {
 				if [ "${sources["$raw_src/$p_ver"]}" = 1 ]; then upped+=("$table_name"); fi
 			else
 				sources["$raw_src/$p_ver"]=0
-				local last_patches=""
+				local last_patches="" tag_name=""
 				if [ "$host" = "gitlab" ]; then
 					local project_enc="${clean_src//\//%2F}"
 					local gl_rel="https://gitlab.com/api/v4/projects/${project_enc}/releases"
@@ -363,6 +397,7 @@ config_update() {
 					else
 						last_patches=$(req "$gl_rel/${p_ver}" -) || continue
 					fi
+					tag_name=$(jq -r '.tag_name // empty' <<<"$last_patches") || continue
 					if ! last_patches=$(jq -e -r '.assets.links[]? | select(.name | (endswith("asc") or endswith("json")) | not) | .name' <<<"$last_patches"); then
 						continue
 					fi
@@ -375,13 +410,20 @@ config_update() {
 					else
 						last_patches=$(gh_req "$rv_rel/tags/${p_ver}" -) || continue
 					fi
+					tag_name=$(jq -r '.tag_name' <<<"$last_patches") || continue
 					if ! last_patches=$(jq -e -r '.assets[] | select(.name | (endswith("asc") or endswith("json")) | not) | .name' <<<"$last_patches"); then
 						continue
 					fi
 				fi
 
 				if [ -n "$last_patches" ]; then
-					if ! OP=$(grep "^Patches: ${org}/" build.md 2>/dev/null | grep -m1 "$last_patches"); then
+					if [[ ! "$last_patches" =~ [0-9] ]]; then
+						local name_only="${last_patches%.*}"
+						local name_ext="${last_patches##*.}"
+						last_patches="${name_only}-${tag_name#v}.${name_ext}"
+					fi
+
+					if ! OP=$(grep -m1 "^Patches: ${org}/${last_patches}" build.md 2>/dev/null); then
 						sources["$raw_src/$p_ver"]=1
 						prcfg=true
 						upped+=("$table_name")
@@ -456,9 +498,20 @@ semver_validate() {
 	[[ ${#ac} -eq 0 ]]
 }
 
+export __TARGET_VERSION_CODE__=""
+export __TARGET_VERSION__=""
+
 get_patch_last_supported_ver() {
-	local list_patches=$1 pkg_name=$2 inc_sel=${3:-} is_experimental=${4:-false}
+	local list_patches=$1 pkg_name=$2 inc_sel=${3:-} is_experimental=${4:-false} arch=${5:-arm64-v8a}
 	local op
+	export __TARGET_VERSION_CODE__=""
+	export __TARGET_VERSION__=""
+
+	local arch_key="ARM64_V8A"
+	if [[ "$arch" == "arm-v7a" ]]; then arch_key="ARMEABI_V7A"
+	elif [[ "$arch" == "x86" ]]; then arch_key="X86"
+	elif [[ "$arch" == "x86_64" ]]; then arch_key="X86_64"; fi
+
 	if [[ -n "$inc_sel" ]]; then
 		if ! op=$(awk '{$1=$1}1' <<<"$list_patches"); then
 			epr "list-patches: '$op'"
@@ -467,27 +520,53 @@ get_patch_last_supported_ver() {
 		local ver vers="" NL=$'\n'
 		while IFS= read -r line; do
 			line="${line:1:${#line}-2}"
-			ver=$(sed -n "/^Name: $line\$/,/^\$/p" <<<"$op" | sed -n "/^Compatible versions:\$/,/^\$/p" | tail -n +2)
-			vers=${ver}${NL}
+			ver=$(sed -n "/^Name: $line\$/,/^\$/p" <<<"$op" | sed -n "/^Compatible versions:\$/,/^\$/p" | tail -n +2 | grep -E '^[0-9]' || true)
+			if [[ -n "$ver" ]]; then
+				vers=${vers}${ver}${NL}
+			fi
 		done <<<"$(list_args "$inc_sel")"
 		vers=$(awk '{$1=$1}1' <<<"$vers")
 		if [[ -n "$vers" ]]; then
-			get_highest_ver <<<"$vers"
-			return
+			local best_ver=$(get_highest_ver <<<"$vers" || true)
+			if [[ -n "$best_ver" && "$best_ver" =~ ^[0-9] ]]; then
+				if [[ "$best_ver" =~ $arch_key=([0-9]+) ]]; then
+					export __TARGET_VERSION_CODE__="${BASH_REMATCH[1]}"
+				fi
+				local clean_ver="${best_ver%%[\[:]*}"
+				clean_ver=$(sed -E 's/-(all|arm64-v8a|armeabi-v7a|arm-v7a|x86_64|x86)$//I' <<<"$clean_ver")
+				export __TARGET_VERSION__=$(echo "${clean_ver}" | tr -d '[:space:]')
+				return 0
+			fi
 		fi
 	fi
-	op=$(patches_list_versions "${args[cli]}" "${args[ptjar]}" "$pkg_name" "$is_experimental") || return 1
-	op=$(sed -n '/Most common compatible versions:/,$p' <<<"$op" | sed '1d' | awk '{$1=$1}1')
-	if [[ "$op" == "Any" ]]; then return; fi
+
+	if ! op=$(patches_list_versions "${args[cli]}" "${args[ptjar]}" "$pkg_name" "$is_experimental"); then
+		return 1
+	fi
+	op=$(sed -n '/Most common compatible versions:/,$p' <<<"$op" | sed '1d' | awk '{$1=$1}1' | grep -E '^[0-9]' || true)
+	if [[ -z "$op" || "$op" == "Any" ]]; then
+		return 0
+	fi
+
 	pcount=$(head -1 <<<"$op") pcount=${pcount#*(} pcount=${pcount% *}
 	if [[ -z "$pcount" ]]; then
 		if grep -Fq "$pkg_name" <<<"$list_patches"; then
-			return
+			return 0
 		else
 			abort "No patches found for '$pkg_name' in patches '${args[ptjar]}'"
 		fi
 	fi
-	grep -F "($pcount patch" <<<"$op" | sed 's/ (.* patch.*//' | get_highest_ver || return 1
+	local best_ver=$(grep -F "($pcount patch" <<<"$op" | sed 's/ (.* patch.*//' | get_highest_ver || true)
+	if [[ -n "$best_ver" && "$best_ver" =~ ^[0-9] ]]; then
+		if [[ "$best_ver" =~ $arch_key=([0-9]+) ]]; then
+			export __TARGET_VERSION_CODE__="${BASH_REMATCH[1]}"
+		fi
+		local clean_ver="${best_ver%%[\[:]*}"
+		clean_ver=$(sed -E 's/-(all|arm64-v8a|armeabi-v7a|arm-v7a|x86_64|x86)$//I' <<<"$clean_ver")
+		export __TARGET_VERSION__=$(echo "${clean_ver}" | tr -d '[:space:]')
+		return 0
+	fi
+	return 0
 }
 
 patches_list_versions() {
@@ -567,12 +646,49 @@ merge_splits() {
 	return 0
 }
 
+patch_apk() {
+	local stock_input=$1 patched_apk=$2 patcher_args=$3 cli_jar=$4 patches_jars=$5
+	local tmp_files
+	tmp_files="$(pwd)/$(mktemp -d -p "$TEMP_DIR")"
+
+	local p_flags=()
+	for pj in $patches_jars; do
+		p_flags+=("-p" "$pj")
+	done
+
+	local cmd="java -jar '$cli_jar' patch '$stock_input' -o '$patched_apk' "${p_flags[@]}" --keystore=ks.keystore \
+    --keystore-entry-password=123456789 --keystore-password=123456789 --signer=jhc --keystore-entry-alias=jhc -t '$patched_apk-tmp' $patcher_args"
+
+	local cli_name
+	cli_name=$(basename "$cli_jar")
+	if [[ "${cli_name::8}" == revanced ]]; then cmd+=" -b"; fi
+
+	if [[ "$OS" == Android ]]; then cmd+=" --custom-aapt2-binary='${AAPT2}'"; fi
+	pr "$cmd"
+	if (set -o pipefail; eval "$cmd" 2>&1 | grep -vE "INFO: Processing|INFO: Writing|INFO: Wrote|INFO: Stripping|INFO: Compiling"); then
+		[[ -f "$patched_apk" ]]
+	else
+		rm -f "$patched_apk" 2>/dev/null || :
+		return 1
+	fi
+}
+
+check_sig() {
+	local file=$1 pkg_name=$2
+	local sig
+	if grep -q "$pkg_name" sig.txt; then
+		sig=$(java -jar "$APKSIGNER" verify --print-certs "$file" | grep ^Signer | grep SHA-256 | tail -1 | awk '{print $NF}')
+		echo "$pkg_name signature: ${sig}"
+		grep -qFx "$sig $pkg_name" sig.txt
+	fi
+}
+
 # ----------------- Pure Python Independent Engine -----------------
 setup_python_backend() {
 	mkdir -p "$TEMP_DIR"
 	if [ ! -f "$TEMP_DIR/network_engine.py" ]; then
 		export PIP_BREAK_SYSTEM_PACKAGES=1
-		python3 -m pip install -q "curl_cffi>=0.7.0" beautifulsoup4 urllib3 requests 2>/dev/null || true
+		python3 -m pip install -q "curl_cffi>=0.16.3" "beautifulsoup4>=4.15.0" "urllib3>=2.7.0" requests 2>/dev/null || true
 		cat << 'EOF' > "$TEMP_DIR/network_engine.py"
 import sys, os, re, time, json, random
 from urllib.parse import urljoin
@@ -594,7 +710,17 @@ except ImportError as e:
 
 COOKIE_JAR = "/tmp/apkmirror_cookies.json"
 BROWSER_CFG = "/tmp/apkmirror_browser.txt"
+UA_CFG = "/tmp/apkmirror_ua.txt"
 SOLVER_URL = os.getenv("CF_SOLVER_URL", "http://localhost:8000")
+
+def is_arch_compat(row_arch, target_arch):
+    ra = (row_arch or "").lower()
+    ta = (target_arch or "").lower()
+    if ta in ("all", "both", "") or "universal" in ra or "noarch" in ra or ta in ra:
+        return True
+    if ta in ("armeabi-v7a", "arm-v7a") and ("armeabi" in ra or "arm-v7a" in ra):
+        return True
+    return False
 
 class Scraper:
     def __init__(self):
@@ -619,6 +745,8 @@ class Scraper:
             try:
                 with open(BROWSER_CFG, "w") as f: f.write(self.current_browser)
                 with open(COOKIE_JAR, "w") as f: json.dump(self.session.cookies.get_dict(), f)
+                if "User-Agent" in self.session.headers:
+                    with open(UA_CFG, "w") as f: f.write(self.session.headers["User-Agent"])
             except Exception: pass
 
     def load_state(self):
@@ -629,6 +757,10 @@ class Scraper:
                 with open(COOKIE_JAR, "r") as f:
                     for k, v in json.load(f).items():
                         self.session.cookies.set(k, v)
+                if os.path.exists(UA_CFG):
+                    with open(UA_CFG, "r") as f:
+                        ua = f.read().strip()
+                        if ua: self.session.headers["User-Agent"] = ua
                 return True
         except Exception: pass
         return False
@@ -637,6 +769,7 @@ class Scraper:
         try:
             if os.path.exists(BROWSER_CFG): os.remove(BROWSER_CFG)
             if os.path.exists(COOKIE_JAR): os.remove(COOKIE_JAR)
+            if os.path.exists(UA_CFG): os.remove(UA_CFG)
         except Exception: pass
 
     def _solve_via_docker_service(self, url):
@@ -725,18 +858,49 @@ class Scraper:
         return None, None
 
     def download(self, url, dest_path, is_bundle, referer):
+        import zipfile
         headers = {"Referer": referer} if referer else {}
-        real_dest = f"{dest_path}.apkm" if is_bundle else dest_path
-        
         log(f"Downloading file: {url}")
-        r_file = self.session.get(url, headers=headers, timeout=300)
-        
-        if r_file.status_code == 200 and r_file.content.startswith(b"PK"):
+        r_file = None
+        if self.session:
+            try:
+                r_file = self.session.get(url, headers=headers, timeout=300)
+            except Exception as e:
+                log(f"Initial download request error: {e}")
+
+        if not r_file or r_file.status_code != 200 or not r_file.content.startswith(b"PK"):
+            status = r_file.status_code if r_file else "None"
+            log(f"Download attempt returned HTTP {status}. Triggering Cloudflare solver bypass...")
+            solve_target = referer if referer else url
+            if self._solve_via_docker_service(solve_target):
+                if referer:
+                    headers["Referer"] = referer
+                try:
+                    r_file = self.session.get(url, headers=headers, timeout=300)
+                except Exception as e:
+                    log(f"Retry download error: {e}")
+
+        if r_file and r_file.status_code == 200 and r_file.content.startswith(b"PK"):
+            real_is_bundle = is_bundle
+            if is_bundle:
+                try:
+                    import io
+                    with zipfile.ZipFile(io.BytesIO(r_file.content)) as z:
+                        names = z.namelist()
+                        has_inner_apks = any(n.endswith(".apk") for n in names)
+                        if not has_inner_apks and ("AndroidManifest.xml" in names or any(n.startswith("classes") for n in names)):
+                            real_is_bundle = False
+                except Exception:
+                    pass
+
+            real_dest = f"{dest_path}.apkm" if real_is_bundle else dest_path
             with open(real_dest, "wb") as f: f.write(r_file.content)
-            with open(f"{dest_path}.is_bundle", "w") as f: f.write("true" if is_bundle else "false")
+            with open(f"{dest_path}.is_bundle", "w") as f: f.write("true" if real_is_bundle else "false")
             log("SUCCESS")
         else:
-            log(f"Download failed. HTTP {r_file.status_code}. Valid Zip: {r_file.content.startswith(b'PK')}")
+            status = r_file.status_code if r_file else "No response"
+            valid_pk = r_file.content.startswith(b"PK") if (r_file and r_file.content) else False
+            log(f"Download failed. HTTP {status}. Valid Zip: {valid_pk}")
             sys.exit(1)
 
 def main():
@@ -770,7 +934,7 @@ def main():
             log(f"Failed to fetch GitHub release: {e}")
             sys.exit(1)
 
-        arch_suffix = re.compile(r"(?:-(all|arm64-v8a|armeabi-v7a|x86_64|x86))?(?:\.apk\.apkm|\.apk|\.apkm)$", re.I)
+        arch_suffix = re.compile(r"(?:-(all|arm64-v8a|armeabi-v7a|x86_64|x86))?(?:\.apk\.apkm|\.apk|\.apkm|\.xapk|\.zip)$", re.I)
 
         if mode == "github_pkg":
             pkg_name = release_data.get("name") or release_data.get("tag_name") or "UNKNOWN"
@@ -782,7 +946,7 @@ def main():
             seen = {}
             for asset in release_data.get("assets", []):
                 name = asset.get("name", "")
-                if name.startswith(prefix) and name.endswith((".apk", ".apkm")):
+                if name.startswith(prefix) and name.endswith((".apk", ".apkm", ".xapk", ".zip")):
                     ver = arch_suffix.sub("", name[len(prefix):])
                     seen[ver] = None
             versions = list(seen.keys()) or [release_data.get("tag_name", "")]
@@ -791,42 +955,46 @@ def main():
                     print(v)
 
         elif mode == "github_dl":
-            version = sys.argv[3] if len(sys.argv) > 3 else ""
-            dest_path = sys.argv[4] if len(sys.argv) > 4 else ""
-            arch = sys.argv[5] if len(sys.argv) > 5 else "all"
-            dpi = sys.argv[6] if len(sys.argv) > 6 else ""
+            version = sys.argv[3].strip() if len(sys.argv) > 3 else ""
+            dest_path = sys.argv[4].strip() if len(sys.argv) > 4 else ""
+            arch = sys.argv[5].strip() if len(sys.argv) > 5 else "all"
+            dpi = sys.argv[6].strip() if len(sys.argv) > 6 else ""
+            version_code = sys.argv[7].strip() if len(sys.argv) > 7 else ""
 
             if arch == "arm-v7a":
                 arch = "armeabi-v7a"
             version_f = version.replace(" ", "").lstrip("v")
 
-            apk_assets = [a for a in release_data.get("assets", []) if a.get("name", "").endswith((".apk", ".apkm"))]
+            apk_assets = [a for a in release_data.get("assets", []) if a.get("name", "").endswith((".apk", ".apkm", ".xapk", ".zip"))]
             target_asset = None
 
-            for a in apk_assets:
-                name = a.get("name", "")
-                if version_f and version_f not in name:
-                    continue
+            def is_arch_ok(file_arch, target_arch):
+                if target_arch in ("all", "both", ""): return True
+                return file_arch == target_arch or file_arch == "all"
 
-                m = arch_suffix.search(name)
-                file_arch = m.group(1).lower() if m and m.group(1) else "all"
-                if arch in ("all", "both"):
-                    if file_arch != "all":
-                        continue
-                else:
-                    if file_arch not in (arch, "all"):
-                        continue
+            # 1st Pass: Match version string AND version code
+            if version_code:
+                for a in apk_assets:
+                    name = a.get("name", "")
+                    if version_f not in name or version_code not in name: continue
+                    m = arch_suffix.search(name)
+                    file_arch = m.group(1).lower() if m and m.group(1) else "all"
+                    if not is_arch_ok(file_arch, arch): continue
+                    target_asset = a
+                    break
 
-                target_asset = a
-                break
-
+            # 2nd Pass: Fallback matching version string only
             if not target_asset:
                 for a in apk_assets:
-                    if version_f and version_f in a.get("name", ""):
-                        target_asset = a
-                        break
+                    name = a.get("name", "")
+                    if version_f and version_f not in name: continue
+                    m = arch_suffix.search(name)
+                    file_arch = m.group(1).lower() if m and m.group(1) else "all"
+                    if not is_arch_ok(file_arch, arch): continue
+                    target_asset = a
+                    break
 
-            if not target_asset and apk_assets:
+            if not target_asset and apk_assets and not version_f:
                 target_asset = apk_assets[0]
 
             if not target_asset:
@@ -834,8 +1002,7 @@ def main():
                 sys.exit(1)
 
             dl_url = target_asset.get("browser_download_url")
-            is_bundle = target_asset.get("name", "").endswith(".apkm")
-            real_dest = f"{dest_path}.apkm" if is_bundle else dest_path
+            is_bundle = target_asset.get("name", "").endswith((".apkm", ".xapk", ".zip"))
 
             log(f"Downloading GitHub asset: {target_asset.get('name')}")
             dl_headers = gh_headers.copy()
@@ -843,10 +1010,23 @@ def main():
 
             r_file = requests.get(dl_url, headers=dl_headers, timeout=300, allow_redirects=True)
             if r_file.status_code == 200 and r_file.content.startswith(b"PK"):
-                with open(real_dest, "wb") as f:
+                real_is_bundle = is_bundle
+                if is_bundle:
+                    try:
+                        import zipfile, io
+                        with zipfile.ZipFile(io.BytesIO(r_file.content)) as z:
+                            names = z.namelist()
+                            has_inner_apks = any(n.endswith(".apk") for n in names)
+                            if not has_inner_apks and ("AndroidManifest.xml" in names or any(n.startswith("classes") for n in names)):
+                                real_is_bundle = False
+                    except Exception:
+                        pass
+                
+                final_dest = f"{dest_path}.apkm" if real_is_bundle else dest_path
+                with open(final_dest, "wb") as f:
                     f.write(r_file.content)
                 with open(f"{dest_path}.is_bundle", "w") as f:
-                    f.write("true" if is_bundle else "false")
+                    f.write("true" if real_is_bundle else "false")
                 log("SUCCESS")
             else:
                 log(f"Download failed. HTTP {r_file.status_code}")
@@ -883,25 +1063,75 @@ def main():
                     print(txt.split()[-1])
 
     elif mode == "apkmirror_dl":
-        version, dest_path, arch, dpi = sys.argv[3:7]
+        version = sys.argv[3].strip() if len(sys.argv) > 3 else ""
+        dest_path = sys.argv[4].strip() if len(sys.argv) > 4 else ""
+        arch = sys.argv[5].strip() if len(sys.argv) > 5 else "all"
+        dpi = sys.argv[6].strip() if len(sys.argv) > 6 else ""
+        version_code = sys.argv[7].strip() if len(sys.argv) > 7 else ""
         if arch == "arm-v7a": arch = "armeabi-v7a"
         
         cat = url.rstrip("/").split("/")[-1]
-        log(f"Searching APKMirror for version {version} ({cat})")
-        
-        search_url = f"{url.rstrip('/')}/?s={version}"
-        soup_search, _ = scraper.get_soup(search_url)
-        if not soup_search: 
-            sys.exit(1)
         
         release_url = None
-        for a in soup_search.select("a.fontBlack[href*='-release/']"):
-            if version in a.get_text() and f"/{cat}/" in a.get("href", ""):
-                release_url = urljoin("https://www.apkmirror.com", a["href"])
-                break
-                
+        exact_release_url = None
+        
+        clean_ver = re.sub(r'-(all|arm64-v8a|armeabi-v7a|arm-v7a|x86_64|x86)$', '', version, flags=re.I).strip()
+        search_term = clean_ver.split("-")[0].strip()
+        clean_target = re.sub(r'[^a-zA-Z0-9]', '', search_term.lower())
+        clean_target_full = re.sub(r'[^a-zA-Z0-9]', '', clean_ver.lower())
+
+        req_suffix = None
+        if "-" in clean_ver:
+            req_suffix = clean_ver.split("-", 1)[1].strip().lower()
+
+        def is_beta_or_alpha(s):
+            s = s.lower()
+            return "beta" in s or "alpha" in s or "lite" in s
+
+        search_url = f"{url.rstrip('/')}/?s={search_term}"
+        log(f"Searching APKMirror via exact path: {search_url}")
+        soup_search, _ = scraper.get_soup(search_url)
+        
+        if soup_search:
+            for a in soup_search.select("a.fontBlack[href*='-release/']"):
+                href = a.get("href", "")
+                txt = a.get_text(strip=True)
+                clean_slug = re.sub(r'[^a-zA-Z0-9]', '', href.lower())
+                clean_txt = re.sub(r'[^a-zA-Z0-9]', '', txt.lower())
+                if f"/{cat}/" in href:
+                    if clean_target_full in clean_slug or clean_target_full in clean_txt:
+                        exact_release_url = urljoin("https://www.apkmirror.com", href)
+                        break
+                    if release_url is None and (clean_target in clean_slug or clean_target in clean_txt):
+                        if req_suffix and not is_beta_or_alpha(req_suffix) and is_beta_or_alpha(clean_slug):
+                            continue
+                        release_url = urljoin("https://www.apkmirror.com", href)
+                        
+        release_url = exact_release_url or release_url
+                    
         if not release_url:
-            log("APKMirror release URL not found via app search.")
+            log("APKMirror release URL not found via path search, trying global search...")
+            global_search_url = f"https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s={cat}+{search_term}"
+
+            soup_search, _ = scraper.get_soup(global_search_url)
+            if soup_search:
+                for a in soup_search.select("a.fontBlack[href*='-release/']"):
+                    txt = a.get_text(strip=True)
+                    href = a.get("href", "")
+                    clean_slug = re.sub(r'[^a-zA-Z0-9]', '', href.lower())
+                    clean_txt = re.sub(r'[^a-zA-Z0-9]', '', txt.lower())
+                    if clean_target_full in clean_slug or clean_target_full in clean_txt:
+                        exact_release_url = urljoin("https://www.apkmirror.com", href)
+                        break
+                    if release_url is None and (clean_target in clean_slug or clean_target in clean_txt):
+                        if req_suffix and not is_beta_or_alpha(req_suffix) and is_beta_or_alpha(clean_slug):
+                            continue
+                        release_url = urljoin("https://www.apkmirror.com", href)
+
+            release_url = exact_release_url or release_url
+
+        if not release_url:
+            log("APKMirror release URL not found.")
             sys.exit(1)
             
         soup_rel, r_rel = scraper.get_soup(release_url, referer=search_url)
@@ -911,34 +1141,88 @@ def main():
         rows = soup_rel.select("div.table-row.headerFont")
         if not rows:
             rows = [r for r in soup_rel.select("div.table-row") if len(r.select("div.table-cell")) >= 4]
-        
-        apparch = {"universal", "noarch", "arm64-v8a + armeabi-v7a", "arm64-v8a + armeabi"}
-        if arch != "all": apparch.add(arch)
-        
+
+        def find_candidate_row(check_func, match_dpi=True):
+            for target_type in ["APK", "BUNDLE"]:
+                for row in reversed(rows):
+                    cells = row.select("div.table-cell")
+                    if len(cells) < 4: continue
+                    badge = cells[0].select_one(".apkm-badge")
+                    b_type = badge.get_text(strip=True).upper() if badge else "APK"
+                    if b_type != target_type: continue
+                    
+                    arch_text = cells[1].get_text(strip=True)
+                    dpi_text = cells[3].get_text(strip=True)
+                    
+                    if not is_arch_compat(arch_text, arch):
+                        continue
+                    
+                    dpi_ok = (not dpi) or (dpi in dpi_text) or (dpi_text in {"nodpi", "anydpi"}) or bool(re.search(r"\d+-\d+dpi", dpi_text))
+                    if match_dpi and not dpi_ok:
+                        continue
+                    
+                    link = row.find("a", href=re.compile(r"/download/")) or cells[0].find("a")
+                    href = link.get("href", "") if link else ""
+                    if not href: continue
+                    
+                    row_text = row.get_text()
+                    if check_func(row_text, href):
+                        return urljoin("https://www.apkmirror.com", href), (target_type == "BUNDLE")
+            return None, False
+
         dl_sub_url = None
         is_bundle = False
-        
-        for target_type in ["APK", "BUNDLE"]:
-            for row in reversed(rows):
-                cells = row.select("div.table-cell")
-                if len(cells) < 4: continue
-                badge = cells[0].select_one(".apkm-badge")
-                b_type = badge.get_text(strip=True).upper() if badge else "APK"
-                
-                if b_type != target_type: continue
-                
-                arch_text = cells[1].get_text(strip=True)
-                dpi_text = cells[3].get_text(strip=True)
-                
-                dpi_ok = not dpi_text or re.match(r"\d+-640dpi", dpi_text) or dpi_text in {"nodpi", "anydpi"} or (dpi and dpi in dpi_text)
-                if arch_text in apparch and dpi_ok:
-                    link = row.find("a", href=re.compile(r"/download/")) or cells[0].find("a")
-                    if link and link.get("href"):
-                        dl_sub_url = urljoin("https://www.apkmirror.com", link["href"])
-                        is_bundle = (target_type == "BUNDLE")
-                        break
-            if dl_sub_url: break
-            
+
+        # Priority 1: Match version_code AND requested suffix (bypassing restrictive DPI range filters)
+        if version_code and req_suffix:
+            dl_sub_url, is_bundle = find_candidate_row(
+                lambda t, h: version_code in t and (
+                    req_suffix in f"{t} {h}".lower() and
+                    not (req_suffix == "release" and is_beta_or_alpha(t))
+                ),
+                match_dpi=False
+            )
+
+        # Priority 2: Match version_code exactly (bypassing restrictive DPI range filters)
+        if not dl_sub_url and version_code:
+            dl_sub_url, is_bundle = find_candidate_row(
+                lambda t, h: version_code in t,
+                match_dpi=False
+            )
+
+        # Priority 3: Match clean_ver or requested suffix (e.g. "release", excluding "lite" / "beta")
+        if not dl_sub_url and req_suffix:
+            dl_sub_url, is_bundle = find_candidate_row(
+                lambda t, h: clean_ver.lower() in t.lower() or (
+                    req_suffix in f"{t} {h}".lower() and 
+                    not (req_suffix == "release" and is_beta_or_alpha(t))
+                ),
+                match_dpi=True
+            )
+
+        # Priority 4: Match search_term avoiding beta/alpha/lite
+        if not dl_sub_url:
+            dl_sub_url, is_bundle = find_candidate_row(
+                lambda t, h: search_term.lower() in t.lower() and not is_beta_or_alpha(f"{t} {h}"),
+                match_dpi=True
+            )
+
+        # Priority 5: Match search_term
+        if not dl_sub_url:
+            dl_sub_url, is_bundle = find_candidate_row(
+                lambda t, h: search_term.lower() in t.lower() and (
+                    not req_suffix or is_beta_or_alpha(req_suffix) or not is_beta_or_alpha(f"{t} {h}")
+                ),
+                match_dpi=True
+            )
+
+        # Priority 6: Fallback to any matching arch
+        if not dl_sub_url:
+            dl_sub_url, is_bundle = find_candidate_row(
+                lambda t, h: not req_suffix or is_beta_or_alpha(req_suffix) or not is_beta_or_alpha(f"{t} {h}"),
+                match_dpi=False
+            )
+
         if not dl_sub_url:
             sys.exit(1)
             
@@ -996,7 +1280,11 @@ def main():
                 if t := el.get_text(strip=True): print(t)
 
     elif mode == "uptodown_dl":
-        version, dest_path, arch, dpi = sys.argv[3:7]
+        version = sys.argv[3].strip() if len(sys.argv) > 3 else ""
+        dest_path = sys.argv[4].strip() if len(sys.argv) > 4 else ""
+        arch = sys.argv[5].strip() if len(sys.argv) > 5 else "all"
+        dpi = sys.argv[6].strip() if len(sys.argv) > 6 else ""
+        version_code = sys.argv[7].strip() if len(sys.argv) > 7 else ""
         if arch == "arm-v7a": arch = "armeabi-v7a"
         
         soup, _ = scraper.get_soup(f"{url}/versions")
@@ -1026,19 +1314,27 @@ def main():
             
         ver_url_data = None
         is_bundle = False
-        for i in range(1, 21):
-            _, r = scraper.get_soup(f"{url}/apps/{data_code}/versions/{i}")
-            if not r or not r.text: continue
-            try:
-                data = json.loads(r.text).get("data", [])
-            except Exception:
-                continue
-            for entry in data:
-                if entry.get("version") == version:
-                    ver_url_data = entry.get("versionURL", {})
-                    is_bundle = (entry.get("kindFile") == "xapk")
-                    break
-            if ver_url_data: break
+
+        def find_version(match_code=True):
+            clean_target_v = re.sub(r'-(all|arm64-v8a|armeabi-v7a|arm-v7a|x86_64|x86)$', '', version, flags=re.I).strip()
+            for i in range(1, 21):
+                _, r = scraper.get_soup(f"{url}/apps/{data_code}/versions/{i}")
+                if not r or not r.text: continue
+                try:
+                    data = json.loads(r.text).get("data", [])
+                except Exception:
+                    continue
+                for entry in data:
+                    entry_ver = entry.get("version", "").strip()
+                    if entry_ver == version or entry_ver == clean_target_v:
+                        if match_code and version_code and str(entry.get("versionCode", "")) != str(version_code):
+                            continue
+                        return entry.get("versionURL", {}), (entry.get("kindFile") == "xapk")
+            return None, False
+
+        ver_url_data, is_bundle = find_version(match_code=True)
+        if not ver_url_data and version_code:
+            ver_url_data, is_bundle = find_version(match_code=False)
 
         if not ver_url_data:
             log(f"Uptodown version {version} not found.")
@@ -1051,9 +1347,6 @@ def main():
         btn_variants = soup_ver.select_one(".button.variants")
 
         if btn_variants and (data_version := btn_variants.get("data-version")):
-            apparch = {"arm64-v8a, armeabi-v7a, x86_64", "arm64-v8a, armeabi-v7a, x86, x86_64", "arm64-v8a, armeabi-v7a"}
-            if arch != "all": apparch.add(arch)
-
             base_url = url.rsplit("/", 1)[0]
             _, r_files = scraper.get_soup(f"{base_url}/app/{data_code}/version/{data_version}/files")
             files_html = json.loads(r_files.text).get("content", "") if r_files else ""
@@ -1061,21 +1354,33 @@ def main():
             content = soup_files.select_one(".content")
             
             matched_id = None
+            first_id = None
+            first_is_bundle = False
             if content:
                 for child in content.children:
                     if not getattr(child, "name", None): continue
                     if "variant" not in child.get("class", []):
                         node_arch = child.get_text(strip=True)
                         continue
-                    if not node_arch or node_arch not in apparch:
-                        continue
                     
                     file_type_tag = child.select_one(".v-file > span")
-                    is_bundle = file_type_tag.get_text(strip=True) == "xapk" if file_type_tag else False
-                    try:
-                        matched_id = child.select_one(".v-report")["data-file-id"]
+                    cur_bundle = file_type_tag.get_text(strip=True).lower() == "xapk" if file_type_tag else False
+                    v_rep = child.select_one(".v-report")
+                    cur_id = v_rep["data-file-id"] if v_rep and "data-file-id" in v_rep.attrs else None
+                    if not cur_id: continue
+
+                    if first_id is None:
+                        first_id = cur_id
+                        first_is_bundle = cur_bundle
+
+                    if is_arch_compat(node_arch, arch):
+                        matched_id = cur_id
+                        is_bundle = cur_bundle
                         break
-                    except Exception: continue
+
+            if not matched_id and first_id:
+                matched_id = first_id
+                is_bundle = first_is_bundle
 
             if matched_id:
                 soup_ver, _ = scraper.get_soup(f"{url}/download/{matched_id}-x")
@@ -1116,10 +1421,10 @@ get_github_vers() {
 }
 
 dl_github() {
-	local url="${1%/}" version=$2 output=$3 arch=$4 dpi=$5
-	rm -f "${output}.is_bundle" "${output}.apkm.is_bundle"
+	local url="${1%/}" version=$2 output=$3 arch=$4 dpi=$5 vcode=${6:-}
+	rm -f "${output}" "${output}.apkm" "${output}.is_bundle" "${output}.apkm.is_bundle"
 
-	if ! run_python_backend "github_dl" "$url" "$version" "$output" "$arch" "$dpi" >/dev/null; then
+	if ! run_python_backend "github_dl" "$url" "$version" "$output" "$arch" "$dpi" "$vcode" >/dev/null; then
 		return 1
 	fi
 
@@ -1157,14 +1462,14 @@ get_apkmirror_pkg_name() {
 get_apkmirror_vers() { run_python_backend "apkmirror_vers" "${__APKMIRROR_URL__:-}"; }
 
 dl_apkmirror() {
-	local url="${1%/}" version=$2 output=$3 arch=$4 dpi=$5
+	local url="${1%/}" version=$2 output=$3 arch=$4 dpi=$5 vcode=${6:-}
 	if [ -f "${output}.apkm" ]; then
 		merge_splits "${output}.apkm" "${output}"
 		return 0
 	fi
 	rm -f "${output}.is_bundle" "${output}.apkm.is_bundle"
 	
-	if ! run_python_backend "apkmirror_dl" "$url" "$version" "$output" "$arch" "$dpi" >/dev/null; then
+	if ! run_python_backend "apkmirror_dl" "$url" "$version" "$output" "$arch" "$dpi" "$vcode" >/dev/null; then
 		return 1
 	fi
 	
@@ -1201,10 +1506,10 @@ get_uptodown_pkg_name() {
 get_uptodown_vers() { run_python_backend "uptodown_vers" "${__UPTODOWN_URL__:-}"; }
 
 dl_uptodown() {
-	local url="${1%/}" version=$2 output=$3 arch=$4 dpi=$5
+	local url="${1%/}" version=$2 output=$3 arch=$4 dpi=$5 vcode=${6:-}
 	rm -f "${output}.is_bundle" "${output}.apkm.is_bundle"
 	
-	if ! run_python_backend "uptodown_dl" "$url" "$version" "$output" "$arch" "$dpi" >/dev/null; then
+	if ! run_python_backend "uptodown_dl" "$url" "$version" "$output" "$arch" "$dpi" "$vcode" >/dev/null; then
 		return 1
 	fi
 	
@@ -1216,7 +1521,7 @@ dl_uptodown() {
 
 # -------------------- archive --------------------
 dl_archive() {
-	local url=$1 version=$2 output=$3 arch=$4
+	local url=$1 version=$2 output=$3 arch=$4 dpi=$5 vcode=${6:-}
 	local path output_m version=${version// /}
 	local version_f=${version#v}
 
@@ -1252,7 +1557,7 @@ get_archive_pkg_name() { echo "${__ARCHIVE_PKG_NAME__:-UNKNOWN}"; }
 
 # -------------------- direct --------------------
 dl_direct() {
-	local url=$1 version=${2// /-} output=$3 arch=$4 _dpi=$5
+	local url=$1 version=${2// /-} output=$3 arch=$4 _dpi=$5 vcode=${6:-}
 	local version_f=${version#v}
 	if ! grep -q "${version_f}-${arch// /}" <<<"$url"; then
 		epr "Given direct-dlurl for $output is not compatible. Set proper 'arch' and 'version' options."
@@ -1270,50 +1575,16 @@ get_direct_pkg_name() { cut -d- -f1 <<<"${__DIRECT_APKNAME__:-}"; }
 get_direct_resp() { __DIRECT_APKNAME__=$(awk -F/ '{print $NF}' <<<"$1"); }
 # --------------------------------------------------
 
-patch_apk() {
-	local stock_input=$1 patched_apk=$2 patcher_args=$3 cli_jar=$4 patches_jars=$5
-	local tmp_files
-	tmp_files="$(pwd)/$(mktemp -d -p "$TEMP_DIR")"
-
-	local p_flags=()
-	for pj in $patches_jars; do
-		p_flags+=("-p" "$pj")
-	done
-
-	local cmd="java -jar '$cli_jar' patch '$stock_input' -o '$patched_apk' "${p_flags[@]}" --keystore=ks.keystore \
-    --keystore-entry-password=123456789 --keystore-password=123456789 --signer=jhc --keystore-entry-alias=jhc -t '$patched_apk-tmp' $patcher_args"
-
-	local cli_name
-	cli_name=$(basename "$cli_jar")
-	if [[ "${cli_name::8}" == revanced ]]; then cmd+=" -b"; fi
-
-	if [[ "$OS" == Android ]]; then cmd+=" --custom-aapt2-binary='${AAPT2}'"; fi
-	pr "$cmd"
-	if (set -o pipefail; eval "$cmd" 2>&1 | grep -vE "INFO: Processing|INFO: Writing|INFO: Wrote|INFO: Stripping|INFO: Compiling"); then
-		[[ -f "$patched_apk" ]]
-	else
-		rm -f "$patched_apk" 2>/dev/null || :
-		return 1
-	fi
-}
-
-check_sig() {
-	local file=$1 pkg_name=$2
-	local sig
-	if grep -q "$pkg_name" sig.txt; then
-		sig=$(java -jar "$APKSIGNER" verify --print-certs "$file" | grep ^Signer | grep SHA-256 | tail -1 | awk '{print $NF}')
-		echo "$pkg_name signature: ${sig}"
-		grep -qFx "$sig $pkg_name" sig.txt
-	fi
-}
-
 build_rv() {
 	eval "declare -A args=${1#*=}"
+	export __TARGET_VERSION_CODE__=""
+	export __TARGET_VERSION__=""
 	local version="" pkg_name=""
 	local mode_arg=${args[build_mode]:-} version_mode=${args[version]:-}
 	local app_name=${args[app_name]:-}
-	local app_name_l=${app_name,,}
-	app_name_l=${app_name_l// /-}
+	local app_name_l
+	app_name_l=$(iconv -f utf-8 -t ascii//TRANSLIT <<<"$app_name" 2>/dev/null || echo "$app_name")
+	app_name_l=$(echo "$app_name_l" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-+|-+$//g')
 	local table=${args[table]:-}
 	local dl_from=${args[dl_from]:-}
 	local arch=${args[arch]:-}
@@ -1354,10 +1625,14 @@ build_rv() {
 
 	local get_latest_ver=false
 	if isoneof "$version_mode" "auto" "experimental"; then
-		if ! version=$(get_patch_last_supported_ver "$list_patches" "$pkg_name" "${args[included_patches]:-}" "$is_experimental"); then
-			epr "get_patch_last_supported_ver failed '$list_patches'"
-			return
-		elif [ -z "$version" ]; then get_latest_ver="true"; fi
+		get_patch_last_supported_ver "$list_patches" "$pkg_name" "${args[included_patches]:-}" "$is_experimental" "${args[arch]}" || true
+		if [[ -z "$__TARGET_VERSION__" ]]; then 
+			get_latest_ver="true"
+			p_patcher_args+=("-f")
+		else
+			version="$__TARGET_VERSION__"
+			p_patcher_args+=("-f")
+		fi
 	elif [ "$version_mode" = "latest" ]; then
 		get_latest_ver="true"
 		p_patcher_args+=("-f")
@@ -1411,9 +1686,15 @@ build_rv() {
 		build_mode_arr=(apk module)
 	fi
 
-	pr "Choosing version '${version}' for ${table}"
 	local version_f=${version// /}
 	version_f=${version_f#v}
+
+	if [[ -n "${__TARGET_VERSION_CODE__:-}" ]]; then
+		pr "Choosing version '${version_f}' (Code: ${__TARGET_VERSION_CODE__}) for ${table}"
+	else
+		pr "Choosing version '${version_f}' for ${table}"
+	fi
+
 	local stock_apk="${TEMP_DIR}/${pkg_name}-${version_f}-${arch_f}.apk"
 	if [[ ! -f "$stock_apk" ]]; then
 		for dl_p in "${DL_SRCS[@]}"; do
@@ -1425,8 +1706,8 @@ build_rv() {
 					continue
 				fi
 			fi
-			if ! dl_${dl_p} "${args[${dl_p}_dlurl]}" "$version" "$stock_apk" "$arch" "${args[dpi]:-}" "$get_latest_ver"; then
-				epr "ERROR: Could not download '${table}' from '${dl_p}' with version '${version}', arch '${arch}', dpi '${args[dpi]:-}'"
+			if ! dl_${dl_p} "${args[${dl_p}_dlurl]}" "$version_f" "$stock_apk" "$arch" "${args[dpi]:-}" "${__TARGET_VERSION_CODE__:-}"; then
+				epr "ERROR: Could not download '${table}' from '${dl_p}' with version '${version_f}', arch '${arch}', dpi '${args[dpi]:-}'"
 				continue
 			fi
 			break
@@ -1440,7 +1721,7 @@ build_rv() {
 	local sig_op
 	if [[ -f "${stock_apk}.apkm" ]]; then
 		rm -rf "${stock_apk}-zip" || :
-		unzip -j "${stock_apk}.apkm" -d "${stock_apk}-zip" >/dev/null
+		unzip -o -q -j "${stock_apk}.apkm" -d "${stock_apk}-zip" >/dev/null 2>&1
 		for a in "${stock_apk}"-zip/*.apk; do
 			if ! sig_op=$(check_sig "$a" "$pkg_name" 2>&1); then
 				epr "Not building $table, apk signature mismatch '$a': $sig_op"
@@ -1454,7 +1735,8 @@ build_rv() {
 			return 0
 		fi
 	fi
-	log "${table}: ${version}"
+	
+	log "📱 » **${table}** (${arch_f}): \`${version_f}\`  "
 
 	local microg_patch
 	microg_patch=$(grep "^Name: " <<<"$list_patches" | grep -i "gmscore\|microg" || :) microg_patch=${microg_patch#*: }
@@ -1464,8 +1746,9 @@ build_rv() {
 	fi
 
 	local patcher_args patched_apk build_mode
-	local rv_brand_f=${args[rv_brand],,}
-	rv_brand_f=${rv_brand_f// /-}
+	local rv_brand_f
+	rv_brand_f=$(iconv -f utf-8 -t ascii//TRANSLIT <<<"${args[rv_brand]}" 2>/dev/null || echo "${args[rv_brand]}")
+	rv_brand_f=$(echo "$rv_brand_f" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-+|-+$//g')
 	if [[ -n "${args[patcher_args]:-}" ]]; then p_patcher_args+=("${args[patcher_args]}"); fi
 	for build_mode in "${build_mode_arr[@]}"; do
 		patcher_args=("${p_patcher_args[@]}")
@@ -1531,18 +1814,40 @@ build_rv() {
 		cp -a $MODULE_TEMPLATE_DIR/. "$base_template"
 		local upj="${table,,}-update.json"
 
-		module_config "$base_template" "$pkg_name" "$version" "$arch"
+		local mod_ver_f="$version_f"
+		local aapt_bin=""
+		if command -v aapt >/dev/null 2>&1; then aapt_bin="aapt"
+		elif command -v aapt2 >/dev/null 2>&1; then aapt_bin="aapt2"
+		elif [[ -n "${ANDROID_HOME:-}" ]]; then aapt_bin=$(find "$ANDROID_HOME/build-tools" -name "aapt" 2>/dev/null | sort -r | head -1);
+		elif [[ -f "${AAPT2:-}" ]]; then aapt_bin="$AAPT2"; fi
+		
+		if [[ -n "$aapt_bin" && -x "$aapt_bin" ]]; then
+			local real_ver
+			real_ver=$("$aapt_bin" dump badging "$patched_apk" 2>/dev/null | grep -m1 "versionName=" | sed -E "s/.*versionName='([^']+)'.*/\1/")
+			if [[ -n "$real_ver" ]]; then mod_ver_f="$real_ver"; fi
+		fi
+
+		module_config "$base_template" "$pkg_name" "$mod_ver_f" "$arch"
 
 		local p_vers=()
 		for pj in ${args[ptjar]}; do
-			p_vers+=("${pj##*-}")
+			local base="${pj##*/}"
+			base="${base%.*}"
+			# Matches semver patterns like 1.41.0, v1.41.0, 1.41.0-dev.5, v1.41.0-dev.5
+			local p_v
+			p_v=$(grep -oE 'v?[0-9]+(\.[0-9]+)+(-[a-zA-Z0-9.]+)?' <<<"$base" | head -1 || true)
+			if [[ -n "$p_v" ]]; then
+				p_vers+=("v${p_v#v}")
+			else
+				p_vers+=("${base}")
+			fi
 		done
 		local patches_ver="${p_vers[*]}"
 
 		module_prop \
 			"${args[module_prop_name]:-}" \
 			"${app_name} ${args[rv_brand]:-}" \
-			"${version} (patches ${patches_ver})" \
+			"${mod_ver_f} (Patch ${patches_ver})" \
 			"${app_name} ${args[rv_brand]:-} module" \
 			"https://raw.githubusercontent.com/${GITHUB_REPOSITORY-}/update/${upj}" \
 			"$base_template"
