@@ -1,0 +1,21 @@
+name: Cleanup Releases
+
+on:
+  schedule:
+    - cron: '0 */1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete old releases
+        uses: jluo1996/delete-releases-action@v1
+        with:
+          tag-pattern: '*'
+          keep-latest: '10'
+          remove-tags: 'true'
+          token: ${{ secrets.GITHUB_TOKEN }}
