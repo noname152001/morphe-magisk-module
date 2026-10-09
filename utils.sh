@@ -93,7 +93,7 @@ get_prebuilts() {
 		fi
 
 		local org="${clean_src%/*}"
-		local dir="${TEMP_DIR}/${org,,}-rv"
+		local dir="${TEMP_DIR}/${clean_src,,}-rv"
 		[[ -d "$dir" ]] || mkdir -p "$dir"
 
 		pr "Getting prebuilts (${clean_src})" >&2
@@ -632,7 +632,8 @@ isoneof() {
 merge_splits() {
 	local bundle=$1 output=$2
 	pr "Merging splits"
-	gh_dl "$TEMP_DIR/apkeditor.jar" "https://github.com/REAndroid/APKEditor/releases/download/V1.4.8/APKEditor-1.4.8.jar" >/dev/null || return 1
+	gh_dl "$TEMP_DIR/apkeditor.jar" "https://github.com/REAndroid/APKEditor/releases/download/V1.4.9/APKEditor-1.4.9.jar" >/dev/null || return 1
+	
 	if ! OP=$(java -jar "$TEMP_DIR/apkeditor.jar" merge -i "$bundle" -o "${output}-unsigned" -clean-meta -f 2>&1); then
 		epr "APKEditor error: $OP"
 		return 1
@@ -688,7 +689,7 @@ setup_python_backend() {
 	mkdir -p "$TEMP_DIR"
 	if [ ! -f "$TEMP_DIR/network_engine.py" ]; then
 		export PIP_BREAK_SYSTEM_PACKAGES=1
-		python3 -m pip install -q "curl_cffi>=0.16.3" "beautifulsoup4>=4.15.0" "urllib3>=2.7.0" requests 2>/dev/null || true
+		python3 -m pip install -q "curl_cffi>=0.16.3" "beautifulsoup4>=4.15.0" "urllib3>=2.8.0" requests 2>/dev/null || true
 		cat << 'EOF' > "$TEMP_DIR/network_engine.py"
 import sys, os, re, time, json, random
 from urllib.parse import urljoin
@@ -1580,7 +1581,7 @@ build_rv() {
 	export __TARGET_VERSION_CODE__=""
 	export __TARGET_VERSION__=""
 	local version="" pkg_name=""
-	local mode_arg=${args[build_mode]:-} version_mode=${args[version]:-}
+	local mode_arg=${args[build_mode]:-} version_mode=${args[version]:-} version_code_mode=${args[version_code]:-}
 	local app_name=${args[app_name]:-}
 	local app_name_l
 	app_name_l=$(iconv -f utf-8 -t ascii//TRANSLIT <<<"$app_name" 2>/dev/null || echo "$app_name")
@@ -1642,6 +1643,11 @@ build_rv() {
 	else
 		version=$version_mode
 		p_patcher_args+=("-f")
+	fi
+
+	# Apply manual version code from config.toml if provided
+	if [[ -n "${version_code_mode:-}" ]]; then
+		export __TARGET_VERSION_CODE__="$version_code_mode"
 	fi
 
 	if [[ $get_latest_ver == true ]]; then
@@ -1736,6 +1742,23 @@ build_rv() {
 		fi
 	fi
 	
+	# === Extract actual versionName from the fresh stock APK via AAPT2 ===
+	local aapt_bin=""
+	if command -v aapt >/dev/null 2>&1; then aapt_bin="aapt"
+	elif command -v aapt2 >/dev/null 2>&1; then aapt_bin="aapt2"
+	elif [[ -n "${ANDROID_HOME:-}" ]]; then aapt_bin=$(find "$ANDROID_HOME/build-tools" -name "aapt" 2>/dev/null | sort -r | head -1);
+	elif [[ -f "${AAPT2:-}" ]]; then aapt_bin="$AAPT2"; fi
+	
+	if [[ -n "$aapt_bin" && -x "$aapt_bin" ]]; then
+		local real_ver
+		real_ver=$("$aapt_bin" dump badging "$stock_apk" 2>/dev/null | grep -m1 "versionName=" | sed -E "s/.*versionName='([^']+)'.*/\1/")
+		if [[ -n "$real_ver" ]]; then 
+			version_f="$real_ver"
+			version="$real_ver"
+		fi
+	fi
+	# =====================================================================
+
 	log "📱 » **${table}** (${arch_f}): \`${version_f}\`  "
 
 	local microg_patch
@@ -1814,20 +1837,7 @@ build_rv() {
 		cp -a $MODULE_TEMPLATE_DIR/. "$base_template"
 		local upj="${table,,}-update.json"
 
-		local mod_ver_f="$version_f"
-		local aapt_bin=""
-		if command -v aapt >/dev/null 2>&1; then aapt_bin="aapt"
-		elif command -v aapt2 >/dev/null 2>&1; then aapt_bin="aapt2"
-		elif [[ -n "${ANDROID_HOME:-}" ]]; then aapt_bin=$(find "$ANDROID_HOME/build-tools" -name "aapt" 2>/dev/null | sort -r | head -1);
-		elif [[ -f "${AAPT2:-}" ]]; then aapt_bin="$AAPT2"; fi
-		
-		if [[ -n "$aapt_bin" && -x "$aapt_bin" ]]; then
-			local real_ver
-			real_ver=$("$aapt_bin" dump badging "$patched_apk" 2>/dev/null | grep -m1 "versionName=" | sed -E "s/.*versionName='([^']+)'.*/\1/")
-			if [[ -n "$real_ver" ]]; then mod_ver_f="$real_ver"; fi
-		fi
-
-		module_config "$base_template" "$pkg_name" "$mod_ver_f" "$arch"
+		module_config "$base_template" "$pkg_name" "$version_f" "$arch"
 
 		local p_vers=()
 		for pj in ${args[ptjar]}; do
@@ -1847,7 +1857,7 @@ build_rv() {
 		module_prop \
 			"${args[module_prop_name]:-}" \
 			"${app_name} ${args[rv_brand]:-}" \
-			"${mod_ver_f} (Patch ${patches_ver})" \
+			"${version_f} (Patch ${patches_ver})" \
 			"${app_name} ${args[rv_brand]:-} module" \
 			"https://raw.githubusercontent.com/${GITHUB_REPOSITORY-}/update/${upj}" \
 			"$base_template"
@@ -1856,10 +1866,17 @@ build_rv() {
 		pr "Packing module ${table}"
 		cp -f "$patched_apk" "${base_template}/base.apk"
 
-		if [[ "${args[include_stock]:-}" != "disable" ]]; then
+			if [[ "${args[include_stock]:-}" != "disable" ]]; then
 			mkdir -p "${base_template}/stock/"
 			if [[ "${args[include_stock]:-}" == "merged" ]]; then
 				cp -f "$stock_apk" "${base_template}/stock/base.apk"
+				
+				# Strip original Meta signatures
+				zip -d "${base_template}/stock/base.apk" "META-INF/*" >/dev/null 2>&1 || true
+				
+				# Re-sign with custom keystore to match the patched APK's signature
+				java -jar "$APKSIGNER" sign --ks ks-p12.keystore --ks-pass pass:123456789 --key-pass pass:123456789 --ks-key-alias jhc --out "${base_template}/stock/base.apk" "${base_template}/stock/base.apk"
+
 			elif [[ "${args[include_stock]:-}" == "split" ]]; then
 				if [[ ! -f "${stock_apk}.apkm" ]]; then
 					epr "Cannot include as 'split' because stock apk of $table is not a bundle"
