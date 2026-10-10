@@ -18,4 +18,5 @@ jobs:
           tag-pattern: '*'
           keep-latest: '10'
           remove-tags: 'true'
+          repository: 'noname152001/morphe-magisk-module'
           token: ${{ secrets.GITHUB_TOKEN }}
