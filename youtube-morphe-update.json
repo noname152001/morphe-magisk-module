@@ -1,6 +1,6 @@
 {
-  "version": "v21.40.161 (Patch v1.47.0-dev.25)",
-  "versionCode": 221,
-  "zipUrl": "https://github.com/noname152001/morphe-magisk-module/releases/download/221/youtube-morphe-module-v21.40.161-all.zip",
+  "version": "v21.40.161 (Patch v1.47.0)",
+  "versionCode": 222,
+  "zipUrl": "https://github.com/noname152001/morphe-magisk-module/releases/download/222/youtube-morphe-module-v21.40.161-all.zip",
   "changelog": "https://raw.githubusercontent.com/noname152001/morphe-magisk-module/update/build.md"
 }
