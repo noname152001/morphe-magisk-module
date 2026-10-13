@@ -1866,35 +1866,30 @@ build_rv() {
 		pr "Packing module ${table}"
 		cp -f "$patched_apk" "${base_template}/base.apk"
 
-			if [[ "${args[include_stock]:-}" != "disable" ]]; then
+		if [[ "${args[include_stock]:-}" != "disable" ]]; then
 			mkdir -p "${base_template}/stock/"
 			if [[ "${args[include_stock]:-}" == "merged" ]]; then
 				cp -f "$stock_apk" "${base_template}/stock/base.apk"
-				
-				# Strip original Meta signatures
-				zip -d "${base_template}/stock/base.apk" "META-INF/*" >/dev/null 2>&1 || true
-				
-				# Re-sign with custom keystore to match the patched APK's signature
-				java -jar "$APKSIGNER" sign --ks ks-p12.keystore --ks-pass pass:123456789 --key-pass pass:123456789 --ks-key-alias jhc --out "${base_template}/stock/base.apk" "${base_template}/stock/base.apk"
-
 			elif [[ "${args[include_stock]:-}" == "split" ]]; then
-				if [[ ! -f "${stock_apk}.apkm" ]]; then
-					epr "Cannot include as 'split' because stock apk of $table is not a bundle"
-					return 0
-				fi
-				if [[ "$arch" == "arm64-v8a" ]]; then
-					unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86_64.apk' -x '*x86.apk' -x '*armeabi_v7a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
-				elif [[ "$arch" == "arm-v7a" ]]; then
-					unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86_64.apk' -x '*x86.apk' -x '*arm64_v8a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
-				elif [[ "$arch" == "x86" ]]; then
-					unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86_64.apk' -x '*arm64_v8a.apk' -x '*armeabi_v7a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
-				elif [[ "$arch" == "x86_64" ]]; then
-					unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86.apk' -x '*arm64_v8a.apk' -x '*armeabi_v7a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
+				if [[ -f "${stock_apk}.apkm" ]]; then
+					if [[ "$arch" == "arm64-v8a" ]]; then
+						unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86_64.apk' -x '*x86.apk' -x '*armeabi_v7a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
+					elif [[ "$arch" == "arm-v7a" ]]; then
+						unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86_64.apk' -x '*x86.apk' -x '*arm64_v8a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
+					elif [[ "$arch" == "x86" ]]; then
+						unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86_64.apk' -x '*arm64_v8a.apk' -x '*armeabi_v7a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
+					elif [[ "$arch" == "x86_64" ]]; then
+						unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86.apk' -x '*arm64_v8a.apk' -x '*armeabi_v7a.apk' -d "${base_template}/stock/" >/dev/null 2>&1
+					else
+						unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86_64.apk' -x '*x86.apk' -d "${base_template}/stock/" >/dev/null 2>&1
+					fi
 				else
-					unzip -j "${stock_apk}.apkm" '*.apk' -x '*x86_64.apk' -x '*x86.apk' -d "${base_template}/stock/" >/dev/null 2>&1
+					# Downloaded file is already a single untouched APK with original signatures
+					cp -f "$stock_apk" "${base_template}/stock/base.apk"
 				fi
 			fi
 		fi
+
 
 		pushd >/dev/null "$base_template" || abort "Module template dir not found"
 		zip -"$COMPRESSION_LEVEL" -FSqr "${CWD}/${BUILD_DIR}/${module_output}" .
@@ -1922,7 +1917,8 @@ module_prop() {
 name=${2}
 version=v${3}
 versionCode=${NEXT_VER_CODE}
-author=j-hc
+author=dj_tanjid | j-hc
+banner=https://raw.githubusercontent.com/dj-tanjid/Morphe-ReVancedX-Builder/teejay/${1}/banner.webp
 description=${4}" >"${6}/module.prop"
 
 	if [[ "$ENABLE_MODULE_UPDATE" == true ]]; then echo "updateJson=${5}" >>"${6}/module.prop"; fi
