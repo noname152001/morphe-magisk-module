@@ -1,6 +1,6 @@
 {
-  "version": "v21.43.523-SECONDARY (Patch v2.0.0-dev.3)",
-  "versionCode": 320,
-  "zipUrl": "https://github.com/noname152001/morphe-magisk-module/releases/download/320/youtube-morphe-module-v21.43.523-SECONDARY-all.zip",
+  "version": "v21.43.523-SECONDARY (Patch v2.0.0)",
+  "versionCode": 321,
+  "zipUrl": "https://github.com/noname152001/morphe-magisk-module/releases/download/321/youtube-morphe-module-v21.43.523-SECONDARY-all.zip",
   "changelog": "https://raw.githubusercontent.com/noname152001/morphe-magisk-module/update/build.md"
 }
